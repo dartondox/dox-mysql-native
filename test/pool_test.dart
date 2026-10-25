@@ -3,7 +3,6 @@ import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:dox_mysql_native/dox_mysql_native.dart';
-import 'package:mysql_dart/exception.dart';
 import 'package:test/test.dart';
 
 /// DB_PORT and DB_USER like the dox_orm tests. MySQL 8.4 or MariaDB 11.
@@ -174,7 +173,7 @@ void main() {
     );
     expect(outside.rows.single['c'], 1);
     await pool.rollback(tx);
-    await expectLater(pool.commit(tx), throwsA(isA<MySQLClientException>()));
+    await expectLater(pool.commit(tx), throwsA(isA<MysqlException>()));
 
     MysqlNativeResult r = await pool.query('SELECT i FROM mn_types');
     expect(r.rows, <Map<String, dynamic>>[
@@ -182,14 +181,15 @@ void main() {
     ]);
   });
 
-  test('server error has the mysql_dart shape', () async {
+  test('server error has code and sqlState', () async {
     await expectLater(
       pool.query('SELECT * FROM no_such_table'),
       throwsA(
-        isA<MySQLServerException>()
-            .having((MySQLServerException e) => e.errorCode, 'code', 1146)
+        isA<MysqlException>()
+            .having((MysqlException e) => e.code, 'code', 1146)
+            .having((MysqlException e) => e.sqlState, 'sqlState', '42S02')
             .having(
-              (MySQLServerException e) => e.message,
+              (MysqlException e) => e.message,
               'message',
               contains('no_such_table'),
             ),
@@ -200,13 +200,28 @@ void main() {
     expect(r.rows.single['one'], 1);
   });
 
+  test('duplicate key gives code 1062 and a sqlState', () async {
+    await pool.execute('DROP TABLE IF EXISTS mn_dup');
+    await pool.execute('CREATE TABLE mn_dup (id INT PRIMARY KEY)');
+    await pool.execute('INSERT INTO mn_dup (id) VALUES (1)');
+    await expectLater(
+      pool.execute('INSERT INTO mn_dup (id) VALUES (1)'),
+      throwsA(
+        isA<MysqlException>()
+            .having((MysqlException e) => e.code, 'code', 1062)
+            .having((MysqlException e) => e.sqlState, 'sqlState', '23000'),
+      ),
+    );
+    await pool.execute('DROP TABLE mn_dup');
+  });
+
   test('wrong password is a server error', () async {
     MysqlNativePool bad = open(password: 'wrong');
     await expectLater(
       bad.query('SELECT 1'),
       throwsA(
-        isA<MySQLServerException>().having(
-          (MySQLServerException e) => e.errorCode,
+        isA<MysqlException>().having(
+          (MysqlException e) => e.code,
           'code',
           1045,
         ),
@@ -215,7 +230,7 @@ void main() {
     bad.close();
   });
 
-  test('connection error is a client error', () async {
+  test('connection error has no code and no sqlState', () async {
     MysqlNativePool bad = MysqlNativePool.open(
       port: 1,
       user: 'root',
@@ -223,7 +238,11 @@ void main() {
     );
     await expectLater(
       bad.query('SELECT 1'),
-      throwsA(isA<MySQLClientException>()),
+      throwsA(
+        isA<MysqlException>()
+            .having((MysqlException e) => e.code, 'code', isNull)
+            .having((MysqlException e) => e.sqlState, 'sqlState', isNull),
+      ),
     );
     bad.close();
   });

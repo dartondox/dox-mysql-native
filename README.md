@@ -23,8 +23,7 @@ Dox 3.x is in alpha (`3.0.0-alpha.x`). The API can still change before the stabl
 
 - Rust ([mysql_async](https://docs.rs/mysql_async)) owns the connections and the pool.
 - Your models and queries stay in Dart. You do not change any config.
-- Values have the same Dart types as with the Dart driver (`mysql_dart`).
-- Server errors are the same `MySQLServerException` class.
+- Errors are `MysqlException`, with `message`, `code` and `sqlState`. For a server error, `code` is the MySQL error number (eg. 1062 for a duplicate key) and `sqlState` is the 5 character SQLSTATE. For other errors both are null.
 - Works with MySQL 8.4 (`caching_sha2_password` login) and MariaDB 11.
 
 ## The native library
@@ -38,7 +37,7 @@ A build hook (`hook/build.dart`) gets the Rust library. It tries these in order:
 The hook has no sha256 list for ready-built libraries yet, because no `dox_mysql_native-v*` release exists yet.
 The release workflow builds them for macOS, Linux and Windows on such a tag.
 So step 2 is skipped, and you need Rust to get the native driver.
-Without Rust, the ORM uses the Dart `mysql_dart` driver and prints one warning line.
+There is no Dart driver fallback. Without the native library, the pool does not work.
 
 Use `dart run`, `dart test` or `dart build cli`. `dart compile exe` does not run build hooks.
 
