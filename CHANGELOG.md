@@ -7,6 +7,7 @@
 - Fewer copies of the result bytes. The record head is written in front of the rows, so the record is not copied again. The first result of a batch is moved into the post buffer, not copied. A batch of 64 KiB or more goes to Dart without a copy (external typed data).
 - The column names are kept per SQL text. The next result of the same query does not decode them again.
 - New `verifyCertificate` on `MysqlNativePool.open()`. It is true by default, so TLS checks the server certificate. Set it to false only for a self-signed certificate in development.
+- Fix: a finished transaction gives its connection back to the pool at once. Before, its connection stayed taken for 300 s after commit or rollback. So after 10 transactions in a row the pool was empty, and the next request waited forever.
 - Breaking: the `mysql_dart` package is removed. There is no Dart driver fallback any more.
 - Breaking: errors are now `MysqlException` (`message`, `code`, `sqlState`). Before, they were `MySQLServerException` and `MySQLClientException` from `mysql_dart`. For a server error, `code` is the MySQL error number (eg. 1062) and `sqlState` is the 5 character SQLSTATE. For other errors both are null.
 

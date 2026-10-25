@@ -181,6 +181,29 @@ void main() {
     ]);
   });
 
+  // a finished transaction gives its connection back at once. Before, it
+  // held it for 300 s, so the 11th transaction waited forever.
+  test('more transactions in a row than the pool has connections', () async {
+    MysqlNativePool small = MysqlNativePool.open(
+      host: Platform.environment['DB_HOST'] ?? '127.0.0.1',
+      port: int.parse(Platform.environment['DB_PORT'] ?? '3306'),
+      user: Platform.environment['DB_USER'] ?? 'root',
+      password: 'password',
+      database: 'dox-framework',
+      maxConnections: 2,
+    );
+    for (int i = 0; i < 6; i++) {
+      int tx = await small.begin();
+      await small.execute('SELECT 1', transaction: tx);
+      if (i.isEven) {
+        await small.commit(tx);
+      } else {
+        await small.rollback(tx);
+      }
+    }
+    small.close();
+  }, timeout: const Timeout(Duration(seconds: 20)));
+
   test('server error has code and sqlState', () async {
     await expectLater(
       pool.query('SELECT * FROM no_such_table'),
