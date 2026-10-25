@@ -28,15 +28,15 @@ const String _releases =
 /// `dart run tool/native_hashes.dart v<version>`
 const Map<String, String> _sha256 = <String, String>{
   'dox_mysql_native-linux-arm64.so':
-      '74c0605a25cab367bfbc4b3e05640a94631474115d783418734b6727c66e22ca',
+      '92125d6317cf1f6b5723bb6776e3daed0d9529167458cfc0f2c46f5b901982e2',
   'dox_mysql_native-linux-x64.so':
-      'fdd6e5d5dcf4115dad6dcd795d781149dafbec5a686f87f82d10c1b60489b384',
+      '29ef4c1196a4e223132e52b551d0e0664509306e0a41c824db39c1da4b985cea',
   'dox_mysql_native-macos-arm64.dylib':
-      '6471fe27968d6a396a5fc402241f7f99c114563c2cdde0e8870340f4893fa975',
+      'd662edee0b4e3b5780ac2625106813a5dc2ad7aa24d3f591fc24c4fa4acb868e',
   'dox_mysql_native-macos-x64.dylib':
-      'd958e63a7f5a6ec9353398fab44875f9e2299c8aaf1c204408d29c9dc302032b',
+      '7855fd3b009514962d438ec98bcf7249cecd6b5470f043583ecd947d0c951173',
   'dox_mysql_native-windows-x64.dll':
-      '0a89ddb06a524c4089f985bad22223b50f28fc7189ad45c88e385e05a5070552',
+      'b75ea239f752f188ff82c395c21d4e43ac39ab811ae24c1285524f4376e28507',
 };
 
 void main(List<String> args) async {
