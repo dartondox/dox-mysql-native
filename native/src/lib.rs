@@ -465,7 +465,7 @@ async fn read<P: Protocol>(
 
 // ---- values ------------------------------------------------------------
 
-/// What the Dart driver gets for a column. Same as the mysql_dart driver.
+/// What Dart gets for a column.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Kind {
     Text,

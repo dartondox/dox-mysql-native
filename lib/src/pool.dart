@@ -5,7 +5,6 @@ import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:dox_mysql_native/src/bindings.dart';
-import 'package:mysql_dart/exception.dart';
 
 /// The result of one query.
 class MysqlNativeResult {
@@ -137,8 +136,8 @@ class MysqlNativePool {
   /// placeholders (like the Dox ORM). Values can be null, int, double,
   /// bool, String, DateTime, Uint8List, or a Map or List (sent as JSON).
   /// [transaction] is an id from [begin].
-  /// Throws [MySQLServerException] for errors from the server (with its
-  /// error code), [MySQLClientException] for others. The same as mysql_dart.
+  /// Throws [MysqlException]. For an error from the server it has the
+  /// error `code` and the `sqlState`. For other errors they are null.
   Future<MysqlNativeResult> query(
     String sql, {
     Object? parameters,
@@ -230,6 +229,30 @@ const int _tBool = 6;
 const int _tJson = 7;
 const int _tLongText = 8;
 
+/// An error from the pool.
+///
+/// For an error from the MySQL server, [code] is the MySQL error number
+/// (eg. 1062 for a duplicate key) and [sqlState] is the 5 character
+/// SQLSTATE. For other errors (eg. no connection) both are null.
+class MysqlException implements Exception {
+  MysqlException(this.message, {this.code, this.sqlState});
+
+  final String message;
+  final int? code;
+  final String? sqlState;
+
+  @override
+  String toString() {
+    String extra = <String>[
+      if (code != null) 'code $code',
+      if (sqlState != null) 'sqlState $sqlState',
+    ].join(', ');
+    return extra.isEmpty
+        ? 'MysqlException: $message'
+        : 'MysqlException($extra): $message';
+  }
+}
+
 /// One per isolate: the port Rust posts results to, and the requests
 /// that wait for them. Requests of one microtask go to Rust in one call.
 class _Link {
@@ -239,7 +262,7 @@ class _Link {
     _handle = doxMysqlClient(_port.sendPort.nativePort);
     if (_handle <= 0) {
       _port.close();
-      throw MySQLClientException('dox_mysql_native: dox_mysql_client failed');
+      throw MysqlException('dox_mysql_native: dox_mysql_client failed');
     }
   }
 
@@ -457,15 +480,19 @@ class _Link {
     }
   }
 
-  static Exception _error(Uint8List b, ByteData d, int at, int len) {
+  static MysqlException _error(Uint8List b, ByteData d, int at, int len) {
     int code = d.getUint16(at, Endian.little);
     int kind = b[at + 2];
     String message = utf8.decode(
       Uint8List.sublistView(b, at + 8, at + len),
       allowMalformed: true,
     );
-    if (kind == 0) return MySQLServerException(message, code);
-    return MySQLClientException(message);
+    if (kind != 0) return MysqlException(message);
+    String sqlState = ascii.decode(
+      Uint8List.sublistView(b, at + 3, at + 8),
+      allowInvalid: true,
+    );
+    return MysqlException(message, code: code, sqlState: sqlState.trim());
   }
 
   /// the column names of the last result of each sql, and the bytes they
