@@ -324,7 +324,9 @@ async fn run(req: Request) -> Result<Vec<u8>, Fail> {
                 used: Mutex::new(Instant::now()),
             });
             let key = TXS.lock().unwrap().insert(tx.clone());
-            tokio::spawn(watch(key, tx));
+            // weak: a commit must give the connection back to the pool now,
+            // not when the watch wakes up
+            tokio::spawn(watch(key, Arc::downgrade(&tx)));
             Ok(ok_head(0, key as u64 + 1))
         }
         OP_COMMIT | OP_ROLLBACK => {
@@ -365,10 +367,14 @@ async fn run(req: Request) -> Result<Vec<u8>, Fail> {
 
 /// Rolls back transaction `key` when Dart sends it no request for
 /// [TIMEOUT] (eg. its isolate is gone), so the pool does not run dry.
-async fn watch(key: usize, tx: Tx) {
+async fn watch(key: usize, weak: std::sync::Weak<TxConn>) {
     loop {
+        // gone: committed or rolled back, and the connection is back
+        let Some(tx) = weak.upgrade() else { return };
         let due = *tx.used.lock().unwrap() + TIMEOUT;
+        drop(tx);
         tokio::time::sleep_until(due).await;
+        let Some(tx) = weak.upgrade() else { return };
         let open = {
             let mut txs = TXS.lock().unwrap();
             let same = txs.get(key).is_some_and(|t| Arc::ptr_eq(t, &tx));
