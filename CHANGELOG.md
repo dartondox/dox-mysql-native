@@ -1,4 +1,6 @@
-## Unreleased
+## 3.0.0-alpha.7
+
+- The package moved to its own repository: https://github.com/dartondox/dox-mysql-native. The ready-built libraries are on its releases (tag `v<version>`).
 
 - Each request now has a timeout of 300 s (pool slot, connect and query), like `dox_postgres_native`. Before, a request could wait for a free connection forever.
 - A transaction that gets no request for 300 s (eg. its isolate is gone) is rolled back, and its connection goes back to the pool. Before, it held the connection forever.

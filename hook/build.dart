@@ -20,13 +20,11 @@ import 'package:code_assets/code_assets.dart';
 import 'package:crypto/crypto.dart';
 import 'package:hooks/hooks.dart';
 
-const String _releases = 'https://github.com/dartondox/dox/releases/download';
+const String _releases = 'https://github.com/dartondox/dox-mysql-native/releases/download';
 
 /// sha256 of each release asset. The release workflow
-/// (.github/workflows/native.yaml) builds the libraries on a
-/// `dox_mysql_native-v*` tag and uploads them with `SHA256SUMS`. Then fill
-/// this map before publishing to pub.dev:
-/// `dart run bin/native_hashes.dart dox_mysql_native-v<version>`
+/// (.github/workflows/ci.yaml) fills it from `SHA256SUMS` of the release:
+/// `dart run tool/native_hashes.dart v<version>`
 const Map<String, String> _sha256 = <String, String>{
   'dox_mysql_native-linux-arm64.so':
       '74c0605a25cab367bfbc4b3e05640a94631474115d783418734b6727c66e22ca',
@@ -121,7 +119,7 @@ Future<Uri?> _download(
     ..connectionTimeout = const Duration(seconds: 30);
   try {
     HttpClientRequest req = await client.getUrl(
-      Uri.parse('$_releases/dox_mysql_native-v$version/$asset'),
+      Uri.parse('$_releases/v$version/$asset'),
     );
     HttpClientResponse res = await req.close();
     if (res.statusCode != 200) {
