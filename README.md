@@ -34,9 +34,8 @@ A build hook (`hook/build.dart`) gets the Rust library. It tries these in order:
 2. A ready-built library from the GitHub release, checked with sha256.
 3. A build from source with `cargo`. This needs [Rust](https://rustup.rs).
 
-The hook has no sha256 list for ready-built libraries yet, because no `dox_mysql_native-v*` release exists yet.
-The release workflow builds them for macOS, Linux and Windows on such a tag.
-So step 2 is skipped, and you need Rust to get the native driver.
+Ready-built libraries exist for macOS (arm64, x64), Linux (x64, arm64) and Windows (x64).
+On these systems you do not need Rust.
 There is no Dart driver fallback. Without the native library, the pool does not work.
 
 Use `dart run`, `dart test` or `dart build cli`. `dart compile exe` does not run build hooks.
