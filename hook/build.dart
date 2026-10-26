@@ -36,7 +36,7 @@ const Map<String, String> _sha256 = <String, String>{
   'dox_mysql_native-macos-x64.dylib':
       '7855fd3b009514962d438ec98bcf7249cecd6b5470f043583ecd947d0c951173',
   'dox_mysql_native-windows-x64.dll':
-      '4f8b0f6955e54b830984aca0a8f19d72aec7c4d114c737822c279d2cde2bc74d',
+      'e461aace5e081f6edeabe066d14bdce8b9363995648705854af472a34d17aba3',
 };
 
 void main(List<String> args) async {
