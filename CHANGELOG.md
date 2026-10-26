@@ -1,3 +1,7 @@
+## 3.0.0
+
+- The first stable release.
+
 ## 3.0.0-alpha.7
 
 - The package moved to its own repository: https://github.com/dartondox/dox-mysql-native. The ready-built libraries are on its releases (tag `v<version>`).
