@@ -1,6 +1,6 @@
-## Unreleased
+## 3.0.1
 
-- The Rust client now runs on the thread of each isolate. Before, every query went to a tokio thread and back (mysql_async). Now a small MySQL client in Rust writes the query to the socket in the same call, and reads the answer when Dart runs next. An idle helper thread wakes Dart only when it is idle and an answer comes. The same change made the Postgres driver about 2 times faster.
+- The Rust client now runs on the thread of each isolate. Before, every query went to a tokio thread and back (mysql_async). Now a small MySQL client in Rust writes the query to the socket in the same call, and reads the answer when Dart runs next. An idle helper thread wakes Dart only when it is idle and an answer comes. `GET /db` on 2 cores went from 111k to 242k requests per second (Bun: 195k).
 - Queries are pipelined: many go down one connection at once, and the server answers them in order. Each query still fails on its own.
 - The pool is still one per process (same settings = same pool), and `maxConnections` still counts for the whole process. A connection that one isolate does not use goes to an isolate that waits. A busy isolate can not starve the others, and busy isolates share the connections fairly.
 - An isolate that dies (eg. it ends without `close()`) gives its connections back at once. Its open transactions roll back.
