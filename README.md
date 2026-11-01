@@ -70,7 +70,7 @@ void main() async {
 ## Features
 
 - Many queries go to Rust in one call. Many results come back in one message.
-- Each connection keeps a prepared statement cache (`statementCacheSize`, 32 by default). Over it, the statement used longest ago is closed.
+- Each connection keeps a prepared statement cache (`statementCacheSize`, 32 by default). Over it, the statement used longest ago is closed. The same SQL with other param types (eg. a number, then a string) is a separate statement.
 - TLS with rustls (`secure: true`). The login works with `caching_sha2_password` (also without TLS: the password goes RSA encrypted) and `mysql_native_password`.
 - A request waits at most 300 s. A transaction that gets no request for 300 s is rolled back.
 - `insertId` and `affectedRows` on each result.

@@ -45,7 +45,7 @@
 //! Commands on a connection are pipelined: the server answers them in
 //! order. A query without params goes as text (COM_QUERY), one with params
 //! as a prepared statement (binary protocol). A statement is prepared once
-//! per connection and kept in an LRU cache. Its first EXECUTE waits behind
+//! per connection and set of param types, and kept in an LRU cache. Its first EXECUTE waits behind
 //! the answer of its PREPARE (it needs the statement id), and the commands
 //! after it wait too, so the order stays. Each command fails on its own.
 //!
@@ -308,6 +308,7 @@ impl Cmd {
 
 /// A prepared statement of one connection.
 struct Stmt {
+    /// the cache key: the sql plus the param types
     sql: String,
     /// None while its PREPARE has no answer
     id: Option<u32>,
@@ -593,11 +594,26 @@ impl Conn {
             return self.put(Cmd::Query(w, sql), ready);
         }
         self.tick += 1;
-        let slot = match self.cache.get(sql.as_str()) {
+        // The cache key is the sql plus the param types. MySQL 8.4 keeps
+        // the types of the first EXECUTE of a statement: a later string
+        // for a param first sent as a number is compared as a number
+        // ('zzz' = 0). So each set of types gets its own statement.
+        let mut key = String::with_capacity(sql.len() + 1 + params.len());
+        key.push_str(&sql);
+        key.push('\0');
+        for p in &params {
+            key.push(match p {
+                Param::Null => 'n',
+                Param::Int(_) => 'i',
+                Param::Double(_) => 'd',
+                Param::Bytes(_) => 's',
+            });
+        }
+        let slot = match self.cache.get(key.as_str()) {
             Some(&s) => s,
             None => {
                 let s = self.stmts.insert(Stmt {
-                    sql: sql.clone(),
+                    sql: key.clone(),
                     id: None,
                     params: 0,
                     failed: None,
@@ -605,7 +621,7 @@ impl Conn {
                     used: 0,
                     cached: true,
                 });
-                self.cache.insert(sql.clone(), s);
+                self.cache.insert(key, s);
                 self.put(Cmd::Prepare(s, sql, w.deadline), ready);
                 s
             }
