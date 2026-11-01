@@ -4,7 +4,7 @@ import 'dart:ffi';
 /// the library as the code asset of this file.
 
 /// The ABI version the Dart side expects. Must match `ABI_VERSION` in Rust.
-const int abiVersion = 2;
+const int abiVersion = 3;
 
 @Native<Int32 Function()>(symbol: 'dox_mysql_version', isLeaf: true)
 external int doxMysqlVersion();
@@ -12,11 +12,18 @@ external int doxMysqlVersion();
 @Native<Int32 Function(Pointer<Void>)>(symbol: 'dox_mysql_init')
 external int doxMysqlInit(Pointer<Void> dlData);
 
-@Native<Int64 Function(Pointer<Uint8>, Int64, Int32)>(
+/// Returns a pool handle (> 0), or -1: then the reason is in [error].
+@Native<Int64 Function(Pointer<Uint8>, Int64, Int32, Pointer<Uint8>, Int64)>(
   symbol: 'dox_mysql_connect',
   isLeaf: true,
 )
-external int doxMysqlConnect(Pointer<Uint8> url, int length, int threads);
+external int doxMysqlConnect(
+  Pointer<Uint8> url,
+  int length,
+  int threads,
+  Pointer<Uint8> error,
+  int errorCapacity,
+);
 
 @Native<Void Function(Int64)>(symbol: 'dox_mysql_close', isLeaf: true)
 external void doxMysqlClose(int pool);

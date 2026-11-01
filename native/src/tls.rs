@@ -12,8 +12,11 @@ use rustls::{ClientConfig, DigitallySignedStruct, Error, RootCertStore, Signatur
 
 use crate::TlsOpts;
 
-/// The client config of a pool. None when it can not be built.
-pub(crate) fn config(o: TlsOpts) -> Option<Arc<ClientConfig>> {
+pub(crate) const NO_ROOTS: &str = "TLS: no root certificate to trust. \
+    Turn on built_in_roots, or set verify_ca=false";
+
+/// The client config of a pool, or why it can not be built.
+pub(crate) fn config(o: TlsOpts) -> Result<Arc<ClientConfig>, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut roots = RootCertStore::empty();
     if o.built_in_roots {
@@ -22,9 +25,9 @@ pub(crate) fn config(o: TlsOpts) -> Option<Arc<ClientConfig>> {
     let roots = Arc::new(roots);
     let builder = ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
-        .ok()?;
+        .map_err(|e| format!("TLS: {e}"))?;
     if o.verify_ca && o.verify_identity {
-        return Some(Arc::new(
+        return Ok(Arc::new(
             builder.with_root_certificates(roots).with_no_client_auth(),
         ));
     }
@@ -34,14 +37,14 @@ pub(crate) fn config(o: TlsOpts) -> Option<Arc<ClientConfig>> {
         .build()
         .ok();
     if inner.is_none() && o.verify_ca {
-        return None;
+        return Err(NO_ROOTS.into());
     }
     let verifier = Lax {
         inner,
         verify_ca: o.verify_ca,
         provider,
     };
-    Some(Arc::new(
+    Ok(Arc::new(
         builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(verifier))

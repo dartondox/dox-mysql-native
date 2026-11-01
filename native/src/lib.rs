@@ -45,7 +45,7 @@ mod tls;
 use proto::Value;
 
 /// Bump when the FFI functions or the record layout change.
-const ABI_VERSION: i32 = 2;
+const ABI_VERSION: i32 = 3;
 
 const OP_QUERY: u8 = 0;
 const OP_EXECUTE: u8 = 1;
@@ -165,6 +165,8 @@ struct Opts {
     nodelay: bool,
     cleartext: bool,
 }
+
+const BAD_URL: &str = "not a mysql:// URL, or an unknown option or a bad option value";
 
 /// Reads a `mysql://user:password@host:port/db?options` URL. It takes the
 /// options of mysql_async (see README.md), so old URLs still work. None:
@@ -670,16 +672,32 @@ pub unsafe extern "C" fn dox_mysql_init(data: *mut c_void) -> i32 {
 /// see README.md). It connects lazily, on the first query. The same URL
 /// gives the same pool, so isolates share it. Each open needs one
 /// [dox_mysql_close]. `_threads` is not used any more (there is no runtime
-/// thread). Returns a handle (> 0), or -1 for a bad URL.
+/// thread). Returns a handle (> 0), or -1 when the pool can not open: then
+/// the reason is in `err` (UTF-8, cut at `err_cap` bytes, the rest
+/// untouched).
 ///
 /// # Safety
 /// `url` must point to `len` bytes (a null `url` or a negative `len` is
-/// an empty URL).
+/// an empty URL). `err` must point to `err_cap` writable bytes (a null
+/// `err` gets no reason).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dox_mysql_connect(url: *const u8, len: i64, _threads: i32) -> i64 {
+pub unsafe extern "C" fn dox_mysql_connect(
+    url: *const u8,
+    len: i64,
+    _threads: i32,
+    err: *mut u8,
+    err_cap: i64,
+) -> i64 {
+    let fail = |text: &str| {
+        if !err.is_null() {
+            let n = text.len().min(err_cap.max(0) as usize);
+            unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), err, n) };
+        }
+        -1
+    };
     let bytes = unsafe { bytes(url, len) };
     let Ok(url) = std::str::from_utf8(bytes) else {
-        return -1;
+        return fail("the URL is not valid UTF-8");
     };
     let mut pools = POOLS.lock().unwrap();
     if let Some((key, entry)) = pools.iter_mut().find(|(_, e)| e.shared.url == url) {
@@ -687,12 +705,12 @@ pub unsafe extern "C" fn dox_mysql_connect(url: *const u8, len: i64, _threads: i
         return key as i64 + 1;
     }
     let Some(opts) = parse_url(url) else {
-        return -1;
+        return fail(BAD_URL);
     };
     let tls = match opts.tls {
         Some(t) => match tls::config(t) {
-            Some(c) => Some(c),
-            None => return -1,
+            Ok(c) => Some(c),
+            Err(e) => return fail(&e),
         },
         None => None,
     };
@@ -747,10 +765,45 @@ pub extern "C" fn dox_mysql_close(handle: i64) {
 mod tests {
     use super::*;
 
+    unsafe fn connect(url: &[u8]) -> i64 {
+        unsafe { dox_mysql_connect(url.as_ptr(), url.len() as i64, 1, std::ptr::null_mut(), 0) }
+    }
+
+    /// The handle, or the reason Dart gets.
+    fn connect_error(url: &str) -> Result<i64, String> {
+        let mut err = [0u8; 256];
+        let h =
+            unsafe { dox_mysql_connect(url.as_ptr(), url.len() as i64, 1, err.as_mut_ptr(), 256) };
+        let end = err.iter().position(|&b| b == 0).unwrap_or(err.len());
+        if h > 0 {
+            Ok(h)
+        } else {
+            Err(String::from_utf8_lossy(&err[..end]).into_owned())
+        }
+    }
+
+    #[test]
+    fn connect_errors_say_why() {
+        assert_eq!(connect_error("mysql://u@h/d?nope=1"), Err(BAD_URL.into()));
+        // TLS with no root to trust and the chain check on
+        assert_eq!(
+            connect_error(
+                "mysql://u@h/d?require_ssl=true&built_in_roots=false&verify_identity=false"
+            ),
+            Err(tls::NO_ROOTS.into())
+        );
+        // the reason is cut at err_cap
+        let url = "mysql://u@h/d?nope=1";
+        let mut err = [0u8; 4];
+        let h =
+            unsafe { dox_mysql_connect(url.as_ptr(), url.len() as i64, 1, err.as_mut_ptr(), 4) };
+        assert_eq!((h, &err), (-1, b"not "));
+    }
+
     #[test]
     fn shared_pool_closes_on_last_close() {
         let url = b"mysql://root@127.0.0.1:1/close_test";
-        let open = || unsafe { dox_mysql_connect(url.as_ptr(), url.len() as i64, 1) };
+        let open = || unsafe { connect(url) };
         let (a, b) = (open(), open());
         assert_eq!(a, b);
         let alive = || POOLS.lock().unwrap().contains((a - 1) as usize);
@@ -771,8 +824,9 @@ mod tests {
             assert!(bytes(b.as_ptr(), i64::MIN).is_empty());
             assert!(bytes(std::ptr::null(), 3).is_empty());
             // a negative length or a null URL is a bad URL, not a crash
-            assert_eq!(dox_mysql_connect(b.as_ptr(), -1, 1), -1);
-            assert_eq!(dox_mysql_connect(std::ptr::null(), 10, 1), -1);
+            let none = std::ptr::null_mut();
+            assert_eq!(dox_mysql_connect(b.as_ptr(), -1, 1, none, 0), -1);
+            assert_eq!(dox_mysql_connect(std::ptr::null(), 10, 1, none, 0), -1);
             assert_eq!(dox_mysql_init(std::ptr::null_mut()), -1);
         }
     }

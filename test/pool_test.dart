@@ -270,6 +270,19 @@ void main() {
     bad.close();
   });
 
+  test('a pool that can not open says why', () {
+    expect(
+      () => MysqlNativePool.fromUrl('mysql://u@h/d?nope=1'),
+      throwsA(
+        isA<ArgumentError>().having(
+          (ArgumentError e) => '${e.message}',
+          'message',
+          contains('unknown option'),
+        ),
+      ),
+    );
+  });
+
   test('bad params', () {
     expect(() => pool.query('SELECT 1', parameters: 1), throwsArgumentError);
   });

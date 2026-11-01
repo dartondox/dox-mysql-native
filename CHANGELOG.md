@@ -1,3 +1,8 @@
+## Unreleased
+
+- A pool that can not open now says why. The `ArgumentError` still starts with `dox_mysql_native: bad connection config`, then the reason (eg. a bad URL option, or a TLS setup that can not work).
+- The native ABI version is now 3.
+
 ## 3.0.1
 
 - The Rust client now runs on the thread of each isolate. Before, every query went to a tokio thread and back (mysql_async). Now a small MySQL client in Rust writes the query to the socket in the same call, and reads the answer when Dart runs next. An idle helper thread wakes Dart only when it is idle and an answer comes. `GET /db` on 2 cores went from 111k to 242k requests per second (Bun: 195k).
