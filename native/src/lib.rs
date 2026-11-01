@@ -45,7 +45,7 @@ mod tls;
 use proto::Value;
 
 /// Bump when the FFI functions or the record layout change.
-const ABI_VERSION: i32 = 2;
+const ABI_VERSION: i32 = 3;
 
 const OP_QUERY: u8 = 0;
 const OP_EXECUTE: u8 = 1;
@@ -128,11 +128,13 @@ fn post(port: i64, data: &[u8]) -> bool {
 // ---- options -----------------------------------------------------------
 
 /// TLS settings from the URL.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 struct TlsOpts {
     verify_ca: bool,
     verify_identity: bool,
     built_in_roots: bool,
+    /// a PEM file with more CA certificates to trust (`ssl_ca`)
+    ca: Option<String>,
 }
 
 /// What a `mysql://` URL says, with the defaults of mysql_async.
@@ -165,6 +167,8 @@ struct Opts {
     nodelay: bool,
     cleartext: bool,
 }
+
+const BAD_URL: &str = "not a mysql:// URL, or an unknown option or a bad option value";
 
 /// Reads a `mysql://user:password@host:port/db?options` URL. It takes the
 /// options of mysql_async (see README.md), so old URLs still work. None:
@@ -214,6 +218,7 @@ fn parse_url(text: &str) -> Option<Opts> {
         verify_ca: true,
         verify_identity: true,
         built_in_roots: true,
+        ca: None,
     };
     let mut require_ssl = false;
     for (k, v) in url.query_pairs() {
@@ -229,6 +234,7 @@ fn parse_url(text: &str) -> Option<Opts> {
             "verify_ca" => tls.verify_ca = flag()?,
             "verify_identity" => tls.verify_identity = flag()?,
             "built_in_roots" => tls.built_in_roots = flag()?,
+            "ssl_ca" => tls.ca = Some(v.into_owned()),
             "client_found_rows" => o.found_rows = flag()?,
             "tcp_nodelay" => o.nodelay = flag()?,
             "enable_cleartext_plugin" => o.cleartext = flag()?,
@@ -616,6 +622,19 @@ fn time_text(neg: bool, days: u32, h: u8, m: u8, s: u8, us: u32) -> String {
 
 // ---- FFI ---------------------------------------------------------------
 
+/// The `len` bytes at `ptr`. Empty when `ptr` is null or `len` is 0 or
+/// negative, so a bad length from Dart can not read wild memory.
+///
+/// # Safety
+/// When `ptr` is not null and `len` > 0, `ptr` must point to `len`
+/// readable bytes.
+unsafe fn bytes<'a>(ptr: *const u8, len: i64) -> &'a [u8] {
+    if ptr.is_null() || len <= 0 {
+        return &[];
+    }
+    unsafe { std::slice::from_raw_parts(ptr, len as usize) }
+}
+
 /// ABI version of this library. Dart checks it at load.
 #[unsafe(no_mangle)]
 pub extern "C" fn dox_mysql_version() -> i32 {
@@ -637,6 +656,9 @@ pub unsafe extern "C" fn dox_mysql_init(data: *mut c_void) -> i32 {
         return -2; // DART_API_DL_MAJOR_VERSION
     }
     let mut entry = api.functions;
+    if entry.is_null() {
+        return -3;
+    }
     unsafe {
         while !(*entry).name.is_null() {
             if CStr::from_ptr((*entry).name).to_bytes() == b"Dart_PostCObject" {
@@ -654,28 +676,51 @@ pub unsafe extern "C" fn dox_mysql_init(data: *mut c_void) -> i32 {
 /// see README.md). It connects lazily, on the first query. The same URL
 /// gives the same pool, so isolates share it. Each open needs one
 /// [dox_mysql_close]. `_threads` is not used any more (there is no runtime
-/// thread). Returns a handle (> 0), or -1 for a bad URL.
+/// thread). Returns a handle (> 0), or -1 when the pool can not open: then
+/// the reason is in `err` (UTF-8, cut at `err_cap` bytes, the rest
+/// untouched).
 ///
 /// # Safety
-/// `url` must point to `len` bytes.
+/// `url` must point to `len` bytes (a null `url` or a negative `len` is
+/// an empty URL). `err` must point to `err_cap` writable bytes (a null
+/// `err` gets no reason).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dox_mysql_connect(url: *const u8, len: i64, _threads: i32) -> i64 {
-    let bytes = unsafe { std::slice::from_raw_parts(url, len as usize) };
+pub unsafe extern "C" fn dox_mysql_connect(
+    url: *const u8,
+    len: i64,
+    _threads: i32,
+    err: *mut u8,
+    err_cap: i64,
+) -> i64 {
+    let fail = |text: &str| {
+        if !err.is_null() {
+            let n = text.len().min(err_cap.max(0) as usize);
+            unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), err, n) };
+        }
+        -1
+    };
+    let bytes = unsafe { bytes(url, len) };
     let Ok(url) = std::str::from_utf8(bytes) else {
-        return -1;
+        return fail("the URL is not valid UTF-8");
     };
-    let mut pools = POOLS.lock().unwrap();
-    if let Some((key, entry)) = pools.iter_mut().find(|(_, e)| e.shared.url == url) {
+    // one more open of a pool with this URL
+    let reuse = |pools: &mut Slab<PoolEntry>| {
+        let (key, entry) = pools.iter_mut().find(|(_, e)| e.shared.url == url)?;
         entry.refs += 1;
-        return key as i64 + 1;
-    }
-    let Some(opts) = parse_url(url) else {
-        return -1;
+        Some(key as i64 + 1)
     };
-    let tls = match opts.tls {
+    if let Some(handle) = reuse(&mut POOLS.lock().unwrap()) {
+        return handle;
+    }
+    // no lock from here: the DNS lookup and the CA file can be slow, and
+    // every isolate needs POOLS
+    let Some(opts) = parse_url(url) else {
+        return fail(BAD_URL);
+    };
+    let tls = match &opts.tls {
         Some(t) => match tls::config(t) {
-            Some(c) => Some(c),
-            None => return -1,
+            Ok(c) => Some(c),
+            Err(e) => return fail(&e),
         },
         None => None,
     };
@@ -686,6 +731,11 @@ pub unsafe extern "C" fn dox_mysql_connect(url: *const u8, len: i64, _threads: i
         None => link::resolve(&opts.host, opts.port).unwrap_or_default(),
     };
     let opts_max = opts.max;
+    let mut pools = POOLS.lock().unwrap();
+    // another isolate may have opened the same URL in the meantime
+    if let Some(handle) = reuse(&mut pools) {
+        return handle;
+    }
     let key = pools.insert(PoolEntry {
         shared: Arc::new(Shared {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
@@ -730,10 +780,45 @@ pub extern "C" fn dox_mysql_close(handle: i64) {
 mod tests {
     use super::*;
 
+    unsafe fn connect(url: &[u8]) -> i64 {
+        unsafe { dox_mysql_connect(url.as_ptr(), url.len() as i64, 1, std::ptr::null_mut(), 0) }
+    }
+
+    /// The handle, or the reason Dart gets.
+    fn connect_error(url: &str) -> Result<i64, String> {
+        let mut err = [0u8; 256];
+        let h =
+            unsafe { dox_mysql_connect(url.as_ptr(), url.len() as i64, 1, err.as_mut_ptr(), 256) };
+        let end = err.iter().position(|&b| b == 0).unwrap_or(err.len());
+        if h > 0 {
+            Ok(h)
+        } else {
+            Err(String::from_utf8_lossy(&err[..end]).into_owned())
+        }
+    }
+
+    #[test]
+    fn connect_errors_say_why() {
+        assert_eq!(connect_error("mysql://u@h/d?nope=1"), Err(BAD_URL.into()));
+        // TLS with no root to trust and the chain check on
+        assert_eq!(
+            connect_error(
+                "mysql://u@h/d?require_ssl=true&built_in_roots=false&verify_identity=false"
+            ),
+            Err(tls::NO_ROOTS.into())
+        );
+        // the reason is cut at err_cap
+        let url = "mysql://u@h/d?nope=1";
+        let mut err = [0u8; 4];
+        let h =
+            unsafe { dox_mysql_connect(url.as_ptr(), url.len() as i64, 1, err.as_mut_ptr(), 4) };
+        assert_eq!((h, &err), (-1, b"not "));
+    }
+
     #[test]
     fn shared_pool_closes_on_last_close() {
         let url = b"mysql://root@127.0.0.1:1/close_test";
-        let open = || unsafe { dox_mysql_connect(url.as_ptr(), url.len() as i64, 1) };
+        let open = || unsafe { connect(url) };
         let (a, b) = (open(), open());
         assert_eq!(a, b);
         let alive = || POOLS.lock().unwrap().contains((a - 1) as usize);
@@ -743,6 +828,38 @@ mod tests {
         assert!(!alive());
         // one more close does nothing
         dox_mysql_close(a);
+    }
+
+    #[test]
+    fn bad_ffi_lengths_and_null_pointers_are_empty() {
+        let b = b"abc";
+        unsafe {
+            assert_eq!(bytes(b.as_ptr(), 3), b"abc");
+            assert!(bytes(b.as_ptr(), -1).is_empty());
+            assert!(bytes(b.as_ptr(), i64::MIN).is_empty());
+            assert!(bytes(std::ptr::null(), 3).is_empty());
+            // a negative length or a null URL is a bad URL, not a crash
+            let none = std::ptr::null_mut();
+            assert_eq!(dox_mysql_connect(b.as_ptr(), -1, 1, none, 0), -1);
+            assert_eq!(dox_mysql_connect(std::ptr::null(), 10, 1, none, 0), -1);
+            assert_eq!(dox_mysql_init(std::ptr::null_mut()), -1);
+        }
+    }
+
+    #[test]
+    fn opens_at_the_same_time_share_one_pool() {
+        let url = "mysql://root@localhost:1/race_test";
+        let handles: Vec<i64> = std::thread::scope(|s| {
+            let open = || s.spawn(|| unsafe { connect(url.as_bytes()) });
+            let all: Vec<_> = (0..8).map(|_| open()).collect();
+            all.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        assert!(handles[0] > 0 && handles.iter().all(|&h| h == handles[0]));
+        let key = (handles[0] - 1) as usize;
+        assert_eq!(POOLS.lock().unwrap()[key].refs, 8);
+        for h in handles {
+            dox_mysql_close(h);
+        }
     }
 
     #[test]
@@ -759,7 +876,10 @@ mod tests {
         assert_eq!((o.max, o.stmt_cache), (5, 8));
         assert_eq!(o.conn_ttl, Some(Duration::from_secs(60)));
         assert!(!o.reset);
-        assert!(!o.tls.unwrap().verify_ca && o.tls.unwrap().verify_identity);
+        let t = o.tls.unwrap();
+        assert!(!t.verify_ca && t.verify_identity && t.ca.is_none());
+        let o = parse_url("mysql://u@h/d?require_ssl=true&ssl_ca=/etc/ca%20b.pem").unwrap();
+        assert_eq!(o.tls.unwrap().ca.as_deref(), Some("/etc/ca b.pem"));
         let o = parse_url(
             "mysql://u@h/d?wait_timeout=7&abs_conn_ttl=9&tcp_keepalive=1500\
              &inactive_connection_ttl=3&compression=fast",

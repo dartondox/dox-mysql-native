@@ -83,6 +83,7 @@ void main() async {
 `MysqlNativePool.fromUrl()` takes the URL options that mysql_async took, so old URLs still work.
 
 These work like before: `pool_max`, `pool_min`, `stmt_cache_size`, `conn_ttl` (close a connection with no traffic for this many seconds), `wait_timeout` (the same, when `conn_ttl` is not set), `inactive_connection_ttl` (close idle connections over `pool_min`), `abs_conn_ttl` and `abs_conn_ttl_jitter` (close a connection after this age, once it has no query), `reset_connection` (on by default: reset the session when a connection has no query left), `tcp_keepalive` (milliseconds), `socket`, `require_ssl`, `verify_ca`, `verify_identity`, `built_in_roots`, `client_found_rows`, `tcp_nodelay` and `enable_cleartext_plugin`.
+`ssl_ca` is new: the path of a PEM file with more CA certificates to trust, eg. a private CA. The Mozilla roots stay trusted, unless `built_in_roots=false`. In `MysqlNativePool.open()` it is `sslRootCert`.
 `MysqlNativePool.open()` sets `reset_connection=false`, so the prepared statements stay.
 
 These are accepted and do nothing:

@@ -72,6 +72,12 @@ class MysqlNativePool {
   /// [verifyCertificate] to false to skip the check, only for a self-signed
   /// certificate in development.
   ///
+  /// [sslRootCert] is the path of a PEM file with more CA certificates to
+  /// trust when [secure] is on, eg. a private CA or the CA bundle of a
+  /// cloud database. The Mozilla roots stay trusted too. Use it instead of
+  /// turning [verifyCertificate] off. A file that is missing or has no
+  /// valid certificate throws an [ArgumentError] with the reason.
+  ///
   /// [maxConnections] is for the whole process: isolates that open the
   /// same settings share it.
   ///
@@ -87,6 +93,7 @@ class MysqlNativePool {
     int maxConnections = 10,
     bool secure = false,
     bool verifyCertificate = true,
+    String? sslRootCert,
     int statementCacheSize = 32,
     Duration maxConnectionAge = const Duration(hours: 12),
     int threads = 1,
@@ -109,6 +116,7 @@ class MysqlNativePool {
         'stmt_cache_size': '$statementCacheSize',
         'conn_ttl': '${maxConnectionAge.inSeconds}',
         if (secure) 'require_ssl': 'true',
+        if (secure && sslRootCert != null) 'ssl_ca': sslRootCert,
         // only for a self-signed certificate in development
         if (secure && !verifyCertificate) ...<String, String>{
           'verify_ca': 'false',
@@ -124,14 +132,31 @@ class MysqlNativePool {
   /// It takes the URL options of mysql_async (see the README), like
   /// `?pool_max=20`, or `?socket=/var/run/mysqld/mysqld.sock` for a Unix
   /// socket. [threads] is not used any more.
+  ///
+  /// Throws an [ArgumentError] with the reason when the pool can not open,
+  /// eg. a bad URL or a TLS setup that can not work.
   factory MysqlNativePool.fromUrl(String url, {int threads = 1}) {
     if (!isAvailable) {
       throw UnsupportedError('dox_mysql_native is not available: $loadError');
     }
     Uint8List bytes = utf8.encode(url);
-    int handle = doxMysqlConnect(bytes.address, bytes.length, threads);
+    Uint8List error = Uint8List(1024);
+    int handle = doxMysqlConnect(
+      bytes.address,
+      bytes.length,
+      threads,
+      error.address,
+      error.length,
+    );
     if (handle <= 0) {
-      throw ArgumentError('dox_mysql_native: bad connection config');
+      int end = error.indexOf(0);
+      String why = utf8.decode(
+        error.sublist(0, end < 0 ? null : end),
+        allowMalformed: true,
+      );
+      throw ArgumentError(
+        'dox_mysql_native: bad connection config${why.isEmpty ? '' : ': $why'}',
+      );
     }
     return MysqlNativePool.fromHandle(handle);
   }
