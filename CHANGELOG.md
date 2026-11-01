@@ -6,8 +6,9 @@
 - An isolate that dies (eg. it ends without `close()`) gives its connections back at once. Its open transactions roll back.
 - The prepared statement cache has an LRU limit (`statementCacheSize`). The statement used longest ago is closed on the server.
 - `threads` of `MysqlNativePool.open()` and `fromUrl()` does nothing any more. There is no runtime thread to size.
-- A transaction id now works only in the isolate that began it.
-- mysql_async and tokio are gone. TLS is rustls with ring, like before. The URL options of mysql_async still work (see the README).
+- A transaction id still works in every isolate. A request from another isolate goes to the isolate that began the transaction, and the answer comes back.
+- mysql_async and tokio are gone. TLS is rustls with ring, like before. The URL options of mysql_async still work (see the README). A few do nothing now; the README says which and why.
+- The host is looked up when the pool opens. When a connect fails, it is looked up again on a helper thread, so a new address (eg. after a failover) is used. The isolate never waits for DNS.
 - The native ABI version is now 2.
 
 ## 3.0.0
