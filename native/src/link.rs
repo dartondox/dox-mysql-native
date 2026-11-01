@@ -35,6 +35,13 @@
 //! marks one busy connection to give back too, and sends no new command
 //! to it, so a busy link can not starve the others.
 //!
+//! The split is fair too. The pool keeps a fair share (max / links that
+//! hold or wait, at least 1). A busy link under its share that finds the
+//! pool full goes to the `hungry` list. A link over its share then gives
+//! back connections as they drain, and takes no new one while others are
+//! hungry. The hot path only reads atomics: the pool lock is taken when a
+//! link starts or stops holding, waiting or being hungry.
+//!
 //! Commands on a connection are pipelined: the server answers them in
 //! order. A query without params goes as text (COM_QUERY), one with params
 //! as a prepared statement (binary protocol). A statement is prepared once
@@ -695,7 +702,9 @@ impl Conn {
     }
 
     /// Reads what the socket has. Ok(false): the server closed it.
-    fn fill(&mut self) -> io::Result<bool> {
+    /// `closed`: the event said the server closed its side, so read on to
+    /// the end (the close comes with no new event).
+    fn fill(&mut self, closed: bool) -> io::Result<bool> {
         let Conn {
             sock,
             tls,
@@ -715,7 +724,7 @@ impl Conn {
                         // A short read took all there was. More data later
                         // is a new edge, so no read just to see WouldBlock.
                         // Not on Windows: mio wants reads until WouldBlock.
-                        if cfg!(unix) && n < free {
+                        if cfg!(unix) && n < free && !closed {
                             return Ok(true);
                         }
                     }
@@ -1180,6 +1189,10 @@ struct Local {
     /// a new connection failed in this turn: the next requests get the
     /// same error, and do not open one more each
     failed: Option<Fail>,
+    /// a request had to share a busy connection because the pool was full
+    want: bool,
+    /// in the `hungry` list of the pool
+    hungry: bool,
 }
 
 /// How to get a connection from the pool.
@@ -1192,13 +1205,23 @@ enum Got {
 impl Shared {
     /// A connection for link `me`: an idle one, or room for a new one.
     /// Only the first waiter may take one while links wait.
+    /// A link at its fair share takes none while others are hungry (the
+    /// first waiter still may).
     fn acquire(&self, me: u64, link: &Weak<Link>) -> Got {
         let mut st = self.state.lock().unwrap();
         if self.closed.load(Ordering::Acquire) {
             return Got::None;
         }
-        if let Some(first) = st.waiters.front()
-            && first.upgrade().map(|l| l.id) != Some(me)
+        let front = st.waiters.front().map(|w| w.upgrade().map(|l| l.id));
+        if front.is_some_and(|id| id != Some(me)) {
+            return Got::None;
+        }
+        // the first waiter always may take one: else idle connections can
+        // pile up while nobody may take them
+        let mine = st.holders.get(&me).map_or(0, |h| h.1);
+        if front.is_none()
+            && st.hungry.iter().any(|&h| h != me)
+            && mine >= self.share.load(Ordering::Acquire)
         {
             return Got::None;
         }
@@ -1211,7 +1234,48 @@ impl Shared {
             return Got::None;
         };
         st.holders.entry(me).or_insert_with(|| (link.clone(), 0)).1 += 1;
+        self.update_share(&st);
         got
+    }
+
+    /// The fair share: max / (links that hold or wait), at least 1. Only
+    /// changes when a link starts or stops holding or waiting.
+    fn update_share(&self, st: &crate::PoolState) {
+        let waiting = st
+            .waiters
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|l| !st.holders.contains_key(&l.id))
+            .count();
+        let active = (st.holders.len() + waiting).max(1);
+        self.share
+            .store((self.opts.max / active).max(1), Ordering::Release);
+    }
+
+    /// Adds or removes link `me` in the hungry list. A new hungry link
+    /// pokes the links over their share, so they give back connections as
+    /// these drain.
+    fn set_hungry(&self, me: u64, on: bool) {
+        let poke: Vec<Arc<Link>> = {
+            let mut st = self.state.lock().unwrap();
+            st.hungry.retain(|&h| h != me);
+            let mut poke = Vec::new();
+            if on {
+                st.hungry.push(me);
+                let share = self.share.load(Ordering::Acquire);
+                poke = st
+                    .holders
+                    .iter()
+                    .filter(|(id, h)| **id != me && h.1 > share)
+                    .filter_map(|(_, (l, _))| l.upgrade())
+                    .collect();
+            }
+            self.hungry.store(st.hungry.len(), Ordering::Release);
+            poke
+        };
+        for l in poke {
+            l.poke();
+        }
     }
 
     /// One connection of link `me` is gone (closed, or `back` in idle).
@@ -1223,6 +1287,9 @@ impl Shared {
                 h.1 -= 1;
                 if h.1 == 0 {
                     st.holders.remove(&me);
+                    st.hungry.retain(|&h| h != me);
+                    self.hungry.store(st.hungry.len(), Ordering::Release);
+                    self.update_share(&st);
                 }
             }
             match back {
@@ -1255,6 +1322,7 @@ impl Shared {
                 first_waiter(&mut st).into_iter().collect()
             };
             self.waiting.store(st.waiters.len(), Ordering::Release);
+            self.update_share(&st);
             poke
         };
         for l in poke {
@@ -1321,7 +1389,7 @@ struct Core {
     id: u64,
     me: Weak<Link>,
     /// scratch: the events of one turn
-    evs: Vec<(usize, bool, bool)>,
+    evs: Vec<(usize, bool, bool, bool)>,
     mail: Arc<Mail>,
     /// requests from other isolates that run here: our id to (their id,
     /// their link)
@@ -1364,6 +1432,8 @@ impl Core {
                     waiter: false,
                     full: false,
                     failed: None,
+                    want: false,
+                    hungry: false,
                 });
                 id
             });
@@ -1564,7 +1634,11 @@ impl Core {
             }
             // pipeline on the least busy one (not a begin)
             match best.filter(|_| !begin) {
-                Some(k) => break k,
+                Some(k) => {
+                    let l = self.pools.get_mut(&pid).unwrap();
+                    l.want |= l.full;
+                    break k;
+                }
                 None => return Err(req),
             }
         };
@@ -1716,6 +1790,11 @@ impl Core {
             }
         }
         let others = |l: &Local| shared.waiting.load(Ordering::Acquire) > usize::from(l.waiter);
+        // others are hungry and this link holds more than its share
+        let over = |l: &Local| {
+            shared.hungry.load(Ordering::Acquire) > usize::from(l.hungry)
+                && l.conns.len() > shared.share.load(Ordering::Acquire)
+        };
         let empty: Vec<usize> = self.pools[&pid]
             .conns
             .iter()
@@ -1730,7 +1809,7 @@ impl Core {
                 // it is not empty now: it may go back after the reset
                 let now = self.now;
                 self.conns[k].reset(now, &mut self.ready);
-            } else if others(l) && !(l.waiter && self.first_is_me(&shared)) {
+            } else if (others(l) && !(l.waiter && self.first_is_me(&shared))) || over(l) {
                 self.park(k);
             } else {
                 self.conns[k].release = false;
@@ -1740,6 +1819,9 @@ impl Core {
             let l = self.pools.get_mut(&pid).unwrap();
             if std::mem::take(&mut l.waiter) {
                 shared.set_waiter(self.id, &self.me, false);
+            }
+            if std::mem::take(&mut l.hungry) {
+                shared.set_hungry(self.id, false);
             }
             if l.conns.is_empty() {
                 self.pools.remove(&pid);
@@ -1764,10 +1846,25 @@ impl Core {
             l.waiter = wait;
             shared.set_waiter(self.id, &self.me, wait);
         }
+        // hungry: busy, under the share, and the pool was full. It stays
+        // hungry until it has its share or has no busy connection.
+        let share = shared.share.load(Ordering::Acquire);
+        let l = self.pools.get_mut(&pid).unwrap();
+        let n = l.conns.len();
+        let hungry = if l.hungry {
+            n < share && l.conns.iter().any(|&k| self.conns[k].load() > 0)
+        } else {
+            l.want && n < share
+        };
+        l.want = false;
+        if hungry != l.hungry {
+            l.hungry = hungry;
+            shared.set_hungry(self.id, hungry);
+        }
         // 5.
         let l = &self.pools[&pid];
         let begin = l.queue.iter().any(|q| q.req.op == OP_BEGIN);
-        if (others(l) || begin) && !l.conns.iter().any(|&k| self.conns[k].release) {
+        if (others(l) || begin || over(l)) && !l.conns.iter().any(|&k| self.conns[k].release) {
             let pick = l
                 .conns
                 .iter()
@@ -1907,19 +2004,20 @@ impl Core {
             if ev.token() == WAKER {
                 continue;
             }
-            let read = ev.is_readable() || ev.is_read_closed() || ev.is_error();
+            let closed = ev.is_read_closed() || ev.is_error();
+            let read = ev.is_readable() || closed;
             let write = ev.is_writable() || ev.is_write_closed() || ev.is_error();
-            evs.push((ev.token().0, read, write));
+            evs.push((ev.token().0, read, write, closed));
         }
-        for &(k, read, write) in &evs {
+        for &(k, read, write, closed) in &evs {
             if self.conns.contains(k) {
-                self.event(k, read, write);
+                self.event(k, read, write, closed);
             }
         }
         self.evs = evs;
     }
 
-    fn event(&mut self, k: usize, read: bool, write: bool) {
+    fn event(&mut self, k: usize, read: bool, write: bool, closed: bool) {
         let registry = self.poll.registry();
         let c = &mut self.conns[k];
         if let Phase::Connect(addrs) = &mut c.phase {
@@ -1964,7 +2062,7 @@ impl Core {
             }
         }
         if read {
-            let open = match c.fill() {
+            let open = match c.fill(closed) {
                 Ok(open) => open,
                 Err(e) => return self.close(k, Some(io_fail(format!("read failed: {e}")))),
             };
@@ -2025,6 +2123,9 @@ impl Core {
         for (_, l) in self.pools.drain() {
             if l.waiter {
                 l.shared.set_waiter(self.id, &self.me, false);
+            }
+            if l.hungry {
+                l.shared.set_hungry(self.id, false);
             }
         }
         self.ready = Vec::new();

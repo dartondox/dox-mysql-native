@@ -280,6 +280,10 @@ struct Shared {
     state: Mutex<PoolState>,
     /// how many links wait for a connection (`state.waiters.len()`)
     waiting: AtomicUsize,
+    /// how many links want more connections (`state.hungry.len()`)
+    hungry: AtomicUsize,
+    /// the fair share of one link: max / active links, at least 1
+    share: AtomicUsize,
     closed: AtomicBool,
 }
 
@@ -295,6 +299,9 @@ struct PoolState {
     /// links that hold connections of this pool, and how many: they give
     /// one back when another link waits
     holders: HashMap<u64, (Weak<link::Link>, usize)>,
+    /// links that hold fewer than their fair share, are busy, and found
+    /// the pool full: links over their share give back to them
+    hungry: Vec<u64>,
 }
 
 struct PoolEntry {
@@ -678,6 +685,7 @@ pub unsafe extern "C" fn dox_mysql_connect(url: *const u8, len: i64, _threads: i
         Some(_) => Vec::new(),
         None => link::resolve(&opts.host, opts.port).unwrap_or_default(),
     };
+    let opts_max = opts.max;
     let key = pools.insert(PoolEntry {
         shared: Arc::new(Shared {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
@@ -688,6 +696,8 @@ pub unsafe extern "C" fn dox_mysql_connect(url: *const u8, len: i64, _threads: i
             resolving: AtomicBool::new(false),
             state: Mutex::new(PoolState::default()),
             waiting: AtomicUsize::new(0),
+            hungry: AtomicUsize::new(0),
+            share: AtomicUsize::new(opts_max),
             closed: AtomicBool::new(false),
         }),
         refs: 1,

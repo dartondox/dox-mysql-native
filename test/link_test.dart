@@ -133,6 +133,22 @@ void main() {
     expect(await busy, greaterThan(0));
   });
 
+  test('two busy isolates share the connections fairly', () async {
+    // A starts alone and takes all 4. Then B gets busy too: A gives back
+    // connections as they drain, until each has 2.
+    List<int> counts = await Future.wait(<Future<int>>[
+      Isolate.run(() => _busyIds(Duration.zero, const Duration(seconds: 3))),
+      Isolate.run(
+        () => _busyIds(
+          const Duration(milliseconds: 500),
+          const Duration(milliseconds: 2500),
+        ),
+      ),
+    ]);
+    expect(counts[0], 2, reason: 'connections of A, B: $counts');
+    expect(counts[1], 2, reason: 'connections of A, B: $counts');
+  });
+
   test('a dead isolate frees its connections', () async {
     // the isolate takes both connections in transactions and dies
     await Isolate.run(_holdAndDie);
@@ -352,6 +368,30 @@ Future<List<int>> _connectionIds(int n) async {
       pool.query('SELECT CONNECTION_ID() AS id, SLEEP(0.001) AS s'),
   ]);
   return <int>[for (MysqlNativeResult r in all) r.rows.single['id'] as int];
+}
+
+/// Waits [start], then keeps 30 queries going for [run]. Returns how
+/// many connections served it from 1.5 s to 2 s of its run (both
+/// isolates are busy then).
+Future<int> _busyIds(Duration start, Duration run) async {
+  await Future<void>.delayed(start);
+  MysqlNativePool pool = open(max: 4, cache: 20);
+  Stopwatch sw = Stopwatch()..start();
+  Set<int> last = <int>{};
+  Future<void> worker() async {
+    while (sw.elapsed < run) {
+      MysqlNativeResult r = await pool.query(
+        'SELECT CONNECTION_ID() AS id, SLEEP(0.002) AS s',
+      );
+      int ms = sw.elapsedMilliseconds;
+      if (ms > 1500 && ms < 2000) {
+        last.add(r.rows.single['id'] as int);
+      }
+    }
+  }
+
+  await Future.wait(<Future<void>>[for (int i = 0; i < 30; i++) worker()]);
+  return last.length;
 }
 
 Future<int> _busy() async {
