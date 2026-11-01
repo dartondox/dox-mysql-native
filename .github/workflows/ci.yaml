@@ -75,8 +75,9 @@ jobs:
           DB_PORT=3307 DB_USER=dox dart test --concurrency=1
           echo "::endgroup::"
 
+  # every PR builds the 5 targets too, so a Windows break shows before a release
   build:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'pull_request' || startsWith(github.ref, 'refs/tags/v')
     strategy:
       fail-fast: false
       matrix:
@@ -91,6 +92,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Check that the tag matches pubspec.yaml
+        if: github.ref_type == 'tag'
         shell: bash
         run: |
           v=$(sed -nE 's/^version:[[:space:]]*([^[:space:]]+).*/\1/p' pubspec.yaml)
@@ -111,6 +113,7 @@ jobs:
           path: dist/${{ matrix.asset }}
 
   release:
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
     permissions:
