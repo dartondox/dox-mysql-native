@@ -703,11 +703,17 @@ pub unsafe extern "C" fn dox_mysql_connect(
     let Ok(url) = std::str::from_utf8(bytes) else {
         return fail("the URL is not valid UTF-8");
     };
-    let mut pools = POOLS.lock().unwrap();
-    if let Some((key, entry)) = pools.iter_mut().find(|(_, e)| e.shared.url == url) {
+    // one more open of a pool with this URL
+    let reuse = |pools: &mut Slab<PoolEntry>| {
+        let (key, entry) = pools.iter_mut().find(|(_, e)| e.shared.url == url)?;
         entry.refs += 1;
-        return key as i64 + 1;
+        Some(key as i64 + 1)
+    };
+    if let Some(handle) = reuse(&mut POOLS.lock().unwrap()) {
+        return handle;
     }
+    // no lock from here: the DNS lookup and the CA file can be slow, and
+    // every isolate needs POOLS
     let Some(opts) = parse_url(url) else {
         return fail(BAD_URL);
     };
@@ -725,6 +731,11 @@ pub unsafe extern "C" fn dox_mysql_connect(
         None => link::resolve(&opts.host, opts.port).unwrap_or_default(),
     };
     let opts_max = opts.max;
+    let mut pools = POOLS.lock().unwrap();
+    // another isolate may have opened the same URL in the meantime
+    if let Some(handle) = reuse(&mut pools) {
+        return handle;
+    }
     let key = pools.insert(PoolEntry {
         shared: Arc::new(Shared {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
@@ -832,6 +843,22 @@ mod tests {
             assert_eq!(dox_mysql_connect(b.as_ptr(), -1, 1, none, 0), -1);
             assert_eq!(dox_mysql_connect(std::ptr::null(), 10, 1, none, 0), -1);
             assert_eq!(dox_mysql_init(std::ptr::null_mut()), -1);
+        }
+    }
+
+    #[test]
+    fn opens_at_the_same_time_share_one_pool() {
+        let url = "mysql://root@localhost:1/race_test";
+        let handles: Vec<i64> = std::thread::scope(|s| {
+            let open = || s.spawn(|| unsafe { connect(url.as_bytes()) });
+            let all: Vec<_> = (0..8).map(|_| open()).collect();
+            all.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        assert!(handles[0] > 0 && handles.iter().all(|&h| h == handles[0]));
+        let key = (handles[0] - 1) as usize;
+        assert_eq!(POOLS.lock().unwrap()[key].refs, 8);
+        for h in handles {
+            dox_mysql_close(h);
         }
     }
 
