@@ -18,6 +18,7 @@ sha1 = "0.10.6"
 ring = "0.17.14"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 slab = "0.4.12"
+socket2 = "0.6.5"
 # the URL parser mysql_async used, so the same URLs work
 url = "2.5.8"
 webpki-roots = "1.0.11"

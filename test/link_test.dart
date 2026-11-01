@@ -247,6 +247,67 @@ void main() {
     checked.close();
   });
 
+  test('a transaction works from another isolate', () async {
+    MysqlNativePool pool = open(cache: 22);
+    await pool.execute('DROP TABLE IF EXISTS mn_cross');
+    await pool.execute('CREATE TABLE mn_cross (id INT)');
+    int tx = await pool.begin();
+    await pool.execute('INSERT INTO mn_cross VALUES (1)', transaction: tx);
+    int handle = pool.handle;
+    // the other isolate sees the row of this transaction, adds one and
+    // commits
+    int seen = await Isolate.run(() => _useTx(handle, tx));
+    expect(seen, 2);
+    MysqlNativeResult r = await pool.query(
+      'SELECT COUNT(*) AS c FROM mn_cross',
+    );
+    expect(r.rows.single['c'], 2);
+    // committed over there: closed here too
+    await expectLater(pool.commit(tx), throwsA(isA<MysqlException>()));
+    await pool.execute('DROP TABLE mn_cross');
+    pool.close();
+  });
+
+  test('a transaction of a dead isolate is closed', () async {
+    MysqlNativePool pool = open(cache: 21);
+    int handle = pool.handle;
+    int tx = await Isolate.run(() => _beginOnly(handle));
+    await expectLater(
+      pool.query('SELECT 1', transaction: tx),
+      throwsA(
+        isA<MysqlException>().having(
+          (MysqlException e) => e.message,
+          'message',
+          contains('transaction is closed'),
+        ),
+      ),
+    );
+    pool.close();
+  });
+
+  test(
+    'reset_connection (on by default in a URL) resets the session',
+    () async {
+      String base =
+          'mysql://${Uri.encodeComponent(user)}:password@$host:$port/'
+          'dox-framework?pool_min=1&pool_max=1';
+      for (bool reset in <bool>[true, false]) {
+        MysqlNativePool pool = MysqlNativePool.fromUrl(
+          reset ? base : '$base&reset_connection=false',
+        );
+        await pool.execute('SET @mn_x = 5');
+        MysqlNativeResult r = await pool.query('SELECT @mn_x AS x');
+        expect(r.rows.single['x'], reset ? isNull : 5);
+        // the prepared statements are gone after a reset: prepared again
+        for (int i = 0; i < 3; i++) {
+          r = await pool.query('SELECT ? AS n', parameters: <Object?>[i]);
+          expect(r.rows.single['n'], i);
+        }
+        pool.close();
+      }
+    },
+  );
+
   test('requests after close fail', () async {
     MysqlNativePool pool = open(cache: 24);
     await pool.query('SELECT 1');
@@ -262,6 +323,26 @@ void main() {
       ),
     );
   });
+}
+
+Future<int> _useTx(int handle, int tx) async {
+  MysqlNativePool pool = MysqlNativePool.fromHandle(handle);
+  await pool.execute(
+    'INSERT INTO mn_cross VALUES (?)',
+    parameters: <Object?>[2],
+    transaction: tx,
+  );
+  MysqlNativeResult r = await pool.query(
+    'SELECT COUNT(*) AS c FROM mn_cross',
+    transaction: tx,
+  );
+  await pool.commit(tx);
+  return r.rows.single['c'] as int;
+}
+
+Future<int> _beginOnly(int handle) async {
+  // no commit: the isolate ends with the transaction open
+  return MysqlNativePool.fromHandle(handle).begin();
 }
 
 Future<List<int>> _connectionIds(int n) async {

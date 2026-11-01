@@ -148,7 +148,18 @@ struct Opts {
     max: usize,
     stmt_cache: usize,
     /// a connection with no IO for this long is closed, not used
+    /// (`conn_ttl`, else `wait_timeout`, like mysql_async)
     conn_ttl: Option<Duration>,
+    /// a connection older than this (plus a random part of `abs_jitter`)
+    /// is closed once it has no command
+    abs_ttl: Option<Duration>,
+    abs_jitter: Option<Duration>,
+    /// an idle connection over `min` closes after this long. 0: never.
+    inactive_ttl: Duration,
+    min: usize,
+    /// COM_RESET_CONNECTION when a connection has no command left
+    reset: bool,
+    keepalive: Option<Duration>,
     tls: Option<TlsOpts>,
     found_rows: bool,
     nodelay: bool,
@@ -187,12 +198,18 @@ fn parse_url(text: &str) -> Option<Opts> {
         max: 100,
         stmt_cache: 32,
         conn_ttl: None,
+        abs_ttl: None,
+        abs_jitter: None,
+        inactive_ttl: Duration::ZERO,
+        min: 10,
+        reset: true,
+        keepalive: None,
         tls: None,
         found_rows: false,
         nodelay: true,
         cleartext: false,
     };
-    let mut min = 10;
+    let mut wait_timeout = None;
     let mut tls = TlsOpts {
         verify_ca: true,
         verify_identity: true,
@@ -203,7 +220,7 @@ fn parse_url(text: &str) -> Option<Opts> {
         let flag = || v.parse::<bool>().ok();
         let num = || v.parse::<u64>().ok();
         match &*k {
-            "pool_min" => min = num()? as usize,
+            "pool_min" => o.min = num()? as usize,
             "pool_max" => o.max = num()? as usize,
             "stmt_cache_size" => o.stmt_cache = num()? as usize,
             "conn_ttl" => o.conn_ttl = Some(Duration::from_secs(num()?)),
@@ -215,26 +232,27 @@ fn parse_url(text: &str) -> Option<Opts> {
             "client_found_rows" => o.found_rows = flag()?,
             "tcp_nodelay" => o.nodelay = flag()?,
             "enable_cleartext_plugin" => o.cleartext = flag()?,
-            // known to mysql_async, not used here
-            "reset_connection" | "prefer_socket" | "secure_auth" => {
+            "reset_connection" => o.reset = flag()?,
+            "wait_timeout" => wait_timeout = Some(Duration::from_secs(num()?)),
+            "abs_conn_ttl" => o.abs_ttl = Some(Duration::from_secs(num()?)),
+            "abs_conn_ttl_jitter" => o.abs_jitter = Some(Duration::from_secs(num()?)),
+            "inactive_connection_ttl" => o.inactive_ttl = Duration::from_secs(num()?),
+            "tcp_keepalive" => o.keepalive = Some(Duration::from_millis(num()?)),
+            // known to mysql_async, not used here (see README.md)
+            "prefer_socket" | "secure_auth" => {
                 flag()?;
             }
-            "inactive_connection_ttl"
-            | "ttl_check_interval"
-            | "abs_conn_ttl"
-            | "abs_conn_ttl_jitter"
-            | "tcp_keepalive"
-            | "max_allowed_packet"
-            | "wait_timeout" => {
+            "ttl_check_interval" | "max_allowed_packet" => {
                 num()?;
             }
             "compression" => {}
             _ => return None,
         }
     }
-    if o.max == 0 || min > o.max {
+    if o.max == 0 || o.min > o.max {
         return None;
     }
+    o.conn_ttl = o.conn_ttl.or(wait_timeout);
     if require_ssl {
         o.tls = Some(tls);
     }
@@ -254,6 +272,11 @@ struct Shared {
     opts: Opts,
     /// None without TLS
     tls: Option<Arc<rustls::ClientConfig>>,
+    /// the addresses of the host, looked up when the pool opens and again
+    /// on a helper thread after a connect fails (so the isolate never
+    /// waits for DNS)
+    addrs: Mutex<Vec<std::net::SocketAddr>>,
+    resolving: AtomicBool,
     state: Mutex<PoolState>,
     /// how many links wait for a connection (`state.waiters.len()`)
     waiting: AtomicUsize,
@@ -649,12 +672,20 @@ pub unsafe extern "C" fn dox_mysql_connect(url: *const u8, len: i64, _threads: i
         },
         None => None,
     };
+    // the one DNS lookup that blocks: when the pool opens. Empty when it
+    // fails: the first connect then looks up again on a helper thread.
+    let addrs = match opts.socket {
+        Some(_) => Vec::new(),
+        None => link::resolve(&opts.host, opts.port).unwrap_or_default(),
+    };
     let key = pools.insert(PoolEntry {
         shared: Arc::new(Shared {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             url: url.to_string(),
             opts,
             tls,
+            addrs: Mutex::new(addrs),
+            resolving: AtomicBool::new(false),
             state: Mutex::new(PoolState::default()),
             waiting: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
@@ -717,7 +748,18 @@ mod tests {
         assert_eq!(o.db.as_deref(), Some("my-db"));
         assert_eq!((o.max, o.stmt_cache), (5, 8));
         assert_eq!(o.conn_ttl, Some(Duration::from_secs(60)));
+        assert!(!o.reset);
         assert!(!o.tls.unwrap().verify_ca && o.tls.unwrap().verify_identity);
+        let o = parse_url(
+            "mysql://u@h/d?wait_timeout=7&abs_conn_ttl=9&tcp_keepalive=1500\
+             &inactive_connection_ttl=3&compression=fast",
+        )
+        .unwrap();
+        assert_eq!(o.conn_ttl, Some(Duration::from_secs(7)));
+        assert_eq!(o.abs_ttl, Some(Duration::from_secs(9)));
+        assert_eq!(o.keepalive, Some(Duration::from_millis(1500)));
+        assert_eq!(o.inactive_ttl, Duration::from_secs(3));
+        assert!(o.reset);
         let o = parse_url("mysql://root@localhost/db?socket=/tmp/my.sock").unwrap();
         assert_eq!(o.socket.as_deref(), Some("/tmp/my.sock"));
         assert_eq!((o.port, o.max, o.tls), (3306, 100, None));

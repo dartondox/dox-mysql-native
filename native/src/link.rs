@@ -43,12 +43,20 @@
 //! after it wait too, so the order stays. Each command fails on its own.
 //!
 //! A transaction holds one connection until commit or rollback. A
-//! transaction with no request for [TIMEOUT] is rolled back.
+//! transaction with no request for [TIMEOUT] is rolled back. Its id works
+//! in every isolate: a request from another isolate goes to the mail of
+//! the link that owns it (`TXS`), and that link gets a poke. It runs the
+//! request and puts the result record in the mail of the sender, which
+//! gets a poke too. Pokes only wake the helper threads, so no leaf call
+//! touches the Dart API.
+//!
+//! DNS: the host is looked up when the pool opens. After a failed connect
+//! a helper thread looks it up again. The isolate never waits for DNS.
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use mio::event::Source;
@@ -84,6 +92,31 @@ const CAPS: u32 = proto::LONG_PASSWORD
     | proto::PLUGIN_AUTH_LENENC
     | proto::DEPRECATE_EOF;
 
+/// Who owns each open transaction, so a request from another isolate
+/// finds the link that holds its connection.
+static TXS: LazyLock<Mutex<HashMap<u64, Weak<Link>>>> = LazyLock::new(Default::default);
+
+/// The transaction is over (commit, rollback, a closed connection).
+fn end_tx(tx: u64) {
+    TXS.lock().unwrap().remove(&tx);
+}
+
+/// Id bit of a request from another isolate, so its record never mixes
+/// with the ids of this isolate's Dart side (they count up from 1).
+const FOREIGN: u64 = 1 << 63;
+
+/// `abs_conn_ttl` plus a random part of `abs_conn_ttl_jitter`.
+fn max_age(o: &crate::Opts) -> Option<Duration> {
+    let ttl = o.abs_ttl?;
+    let jitter = o.abs_jitter.map_or(0, |j| j.as_millis() as u64);
+    if jitter == 0 {
+        return Some(ttl);
+    }
+    let mut b = [0u8; 8];
+    let _ = ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut b);
+    Some(ttl + Duration::from_millis(u64::from_le_bytes(b) % jitter))
+}
+
 // ---- sockets -----------------------------------------------------------
 
 enum Sock {
@@ -101,9 +134,16 @@ impl Sock {
         }
     }
 
-    fn nodelay(&self, on: bool) {
+    /// TCP_NODELAY and keepalive (`tcp_keepalive`, like mysql_async).
+    fn tune(&self, nodelay: bool, keepalive: Option<Duration>) {
         match self {
-            Sock::Tcp(s) => drop(s.set_nodelay(on)),
+            Sock::Tcp(s) => {
+                let _ = s.set_nodelay(nodelay);
+                if let Some(t) = keepalive {
+                    let ka = socket2::TcpKeepalive::new().with_time(t);
+                    let _ = socket2::SockRef::from(s).set_tcp_keepalive(&ka);
+                }
+            }
             #[cfg(unix)]
             Sock::Unix(_) => {}
         }
@@ -191,6 +231,8 @@ enum What {
     Silent,
     /// COM_STMT_PREPARE of a statement slot
     Prepare(usize),
+    /// COM_RESET_CONNECTION: nobody waits, an error is ignored
+    Reset,
 }
 
 /// Where the answer of a command is.
@@ -244,13 +286,14 @@ enum Cmd {
     Exec(Wait, usize, Vec<Param>),
     Prepare(usize, String, Instant),
     Close(usize),
+    Reset(Instant),
 }
 
 impl Cmd {
     fn deadline(&self) -> Option<Instant> {
         match self {
             Cmd::Query(w, _) | Cmd::Exec(w, ..) => Some(w.deadline),
-            Cmd::Prepare(_, _, d) => Some(*d),
+            Cmd::Prepare(_, _, d) | Cmd::Reset(d) => Some(*d),
             Cmd::Close(_) => None,
         }
     }
@@ -316,12 +359,47 @@ pub(crate) struct Conn {
     last_io: Instant,
     /// the last request of its transaction
     used: Instant,
+    born: Instant,
+    /// `abs_conn_ttl` plus its jitter. None: no limit.
+    max_age: Option<Duration>,
+    /// used since its last COM_RESET_CONNECTION
+    dirty: bool,
     /// the transaction that holds it
     tx: Option<u64>,
     /// a COMMIT or ROLLBACK runs: not free yet
     ending: bool,
     /// give it back once it has no command: no new command goes to it
     release: bool,
+}
+
+/// The addresses of a host (a blocking DNS lookup: only when a pool opens,
+/// or on a helper thread).
+pub(crate) fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    Ok((host, port).to_socket_addrs()?.collect())
+}
+
+impl Shared {
+    /// Looks the host up again on a helper thread (eg. after a failover
+    /// the name points to a new server). The next connect uses it.
+    fn resolve_later(self: &Arc<Self>) {
+        if self.opts.socket.is_some() || self.resolving.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let shared = self.clone();
+        let started = std::thread::Builder::new()
+            .name("dox-mysql-dns".into())
+            .spawn(move || {
+                if let Ok(a) = resolve(&shared.opts.host, shared.opts.port)
+                    && !a.is_empty()
+                {
+                    *shared.addrs.lock().unwrap() = a;
+                }
+                shared.resolving.store(false, Ordering::Release);
+            });
+        if started.is_err() {
+            self.resolving.store(false, Ordering::Release);
+        }
+    }
 }
 
 /// Opens a socket to the next address. The connect goes on in the loop.
@@ -338,8 +416,8 @@ fn connect_next(addrs: &mut Vec<SocketAddr>) -> Result<Sock, Fail> {
 }
 
 impl Conn {
-    /// Starts a connection: a non-blocking connect. DNS blocks.
-    /// ponytail: a blocking lookup. An IP or localhost is instant.
+    /// Starts a connection: a non-blocking connect to the addresses the
+    /// pool looked up. No DNS lookup here.
     fn start(shared: Arc<Shared>, now: Instant) -> Result<Conn, Fail> {
         let o = &shared.opts;
         let (sock, phase) = if let Some(path) = &o.socket {
@@ -354,13 +432,15 @@ impl Conn {
                 return Err(io_fail(format!("no Unix sockets on this system: {path}")));
             }
         } else {
-            let mut addrs: Vec<SocketAddr> = (o.host.as_str(), o.port)
-                .to_socket_addrs()
-                .map_err(|e| io_fail(format!("{}:{}: {e}", o.host, o.port)))?
-                .collect();
-            let s = connect_next(&mut addrs)?;
+            let mut addrs = shared.addrs.lock().unwrap().clone();
+            if addrs.is_empty() {
+                shared.resolve_later();
+                return Err(io_fail(format!("can not find the host {}", o.host)));
+            }
+            let s = connect_next(&mut addrs).inspect_err(|_| shared.resolve_later())?;
             (s, Phase::Connect(addrs))
         };
+        let max_age = max_age(o);
         Ok(Conn {
             sock,
             tls: None,
@@ -382,6 +462,9 @@ impl Conn {
             maria: false,
             last_io: now,
             used: now,
+            max_age,
+            born: now,
+            dirty: false,
             tx: None,
             ending: false,
             release: false,
@@ -448,6 +531,10 @@ impl Conn {
                 proto::prepare(&mut self.out, sql.as_bytes());
                 self.waits
                     .push_back(Wait::new(0, What::Prepare(slot), deadline));
+            }
+            Cmd::Reset(deadline) => {
+                proto::reset(&mut self.out);
+                self.waits.push_back(Wait::new(0, What::Reset, deadline));
             }
             Cmd::Close(slot) => {
                 let st = self.stmts.remove(slot);
@@ -967,6 +1054,7 @@ impl Conn {
             }
             What::Begin(tx) => match w.fail {
                 Some(f) => {
+                    end_tx(tx);
                     self.tx = None;
                     push(ready, record(w.id, Err(f)));
                 }
@@ -987,12 +1075,26 @@ impl Conn {
                 }
             }
             What::Silent => self.ending = false,
-            What::Prepare(_) => {}
+            What::Prepare(_) | What::Reset => {}
         }
+    }
+
+    /// Resets the session (`reset_connection`, on by default in
+    /// mysql_async): the server forgets session variables, temporary
+    /// tables and prepared statements. Only for a connection with no
+    /// command.
+    fn reset(&mut self, now: Instant, ready: &mut Vec<u8>) {
+        self.dirty = false;
+        self.stmts.clear();
+        self.cache.clear();
+        self.put(Cmd::Reset(now + TIMEOUT), ready);
     }
 
     /// A ROLLBACK nobody waits for. The connection is free after it.
     fn rollback(&mut self, now: Instant, ready: &mut Vec<u8>) {
+        if let Some(tx) = self.tx {
+            end_tx(tx);
+        }
         self.tx = None;
         self.ending = true;
         let w = Wait::new(0, What::Silent, now + TIMEOUT);
@@ -1220,6 +1322,24 @@ struct Core {
     me: Weak<Link>,
     /// scratch: the events of one turn
     evs: Vec<(usize, bool, bool)>,
+    mail: Arc<Mail>,
+    /// requests from other isolates that run here: our id to (their id,
+    /// their link)
+    foreign: HashMap<u64, (u64, Weak<Link>)>,
+    next_foreign: u64,
+}
+
+/// A request from another link, and who sent it.
+type FromLink = (Request, Weak<Link>);
+
+/// What other links send to a link.
+#[derive(Default)]
+struct Mail {
+    /// requests for transactions of this link, and who sent them. true:
+    /// the link is gone, it takes no more.
+    reqs: Mutex<(bool, Vec<FromLink>)>,
+    /// result records of requests this link sent to other links
+    results: Mutex<Vec<u8>>,
 }
 
 static NEXT_TX: AtomicU64 = AtomicU64::new(1);
@@ -1292,12 +1412,12 @@ impl Core {
         }
         self.timers();
         self.flush_all();
+        self.route();
     }
 
     /// A request in a transaction: it goes to the connection of the
     /// transaction. Commit and rollback end it.
-    // ponytail: a linear scan of the connections of this link. A
-    // transaction id works only in the isolate that began it.
+    // ponytail: a linear scan of the connections of this link.
     fn in_tx(&mut self, req: Request, deadline: Instant) {
         let Some(key) = self
             .conns
@@ -1305,12 +1425,14 @@ impl Core {
             .find(|(_, c)| c.tx == Some(req.tx))
             .map(|(k, _)| k)
         else {
-            return self.fail(req.id, Fail::client(TX_CLOSED));
+            return self.forward(req);
         };
         let c = &mut self.conns[key];
         c.used = self.now;
+        c.dirty = true;
         match req.op {
             OP_COMMIT | OP_ROLLBACK => {
+                end_tx(req.tx);
                 c.tx = None;
                 c.ending = true;
                 let sql = if req.op == OP_COMMIT {
@@ -1336,6 +1458,79 @@ impl Core {
                 );
             }
             op => self.fail(req.id, Fail::Client(format!("unknown op {op}"))),
+        }
+    }
+
+    /// A request for a transaction of another isolate: it goes to the link
+    /// that owns the transaction, which gets a poke. Its result comes back
+    /// in our mail. The owner is gone: the transaction is closed (the
+    /// server rolled it back when the connection closed).
+    fn forward(&mut self, req: Request) {
+        let owner = TXS.lock().unwrap().get(&req.tx).and_then(Weak::upgrade);
+        let Some(owner) = owner.filter(|o| o.id != self.id) else {
+            return self.fail(req.id, Fail::client(TX_CLOSED));
+        };
+        let mut q = owner.mail.reqs.lock().unwrap();
+        if q.0 {
+            drop(q);
+            return self.fail(req.id, Fail::client(TX_CLOSED));
+        }
+        q.1.push((req, self.me.clone()));
+        drop(q);
+        owner.poke();
+    }
+
+    /// Runs the requests other isolates sent for our transactions, and
+    /// takes the results of the ones we sent.
+    fn read_mail(&mut self) {
+        let results = std::mem::take(&mut *self.mail.results.lock().unwrap());
+        if !results.is_empty() {
+            self.ready.extend_from_slice(&results);
+        }
+        let reqs = std::mem::take(&mut self.mail.reqs.lock().unwrap().1);
+        for (mut req, from) in reqs {
+            self.next_foreign += 1;
+            let id = FOREIGN | self.next_foreign;
+            self.foreign.insert(id, (req.id, from));
+            req.id = id;
+            self.in_tx(req, self.now + TIMEOUT);
+        }
+    }
+
+    /// Moves the records of requests from other isolates out of `ready`,
+    /// to the mail of the isolate that sent them.
+    fn route(&mut self) {
+        if self.foreign.is_empty() || self.ready.is_empty() {
+            return;
+        }
+        let all = std::mem::take(&mut self.ready);
+        let mut out: Vec<(Weak<Link>, Vec<u8>)> = Vec::new();
+        let mut p = 0;
+        while p + RES_HEAD <= all.len() {
+            let id = u64::from_le_bytes(all[p..p + 8].try_into().unwrap());
+            let len = u32::from_le_bytes(all[p + 12..p + 16].try_into().unwrap()) as usize;
+            let rec = &all[p..p + RES_HEAD + len];
+            p += RES_HEAD + len;
+            let Some((theirs, from)) = self.foreign.remove(&id) else {
+                self.ready.extend_from_slice(rec);
+                continue;
+            };
+            let at = match out.iter().position(|(l, _)| l.ptr_eq(&from)) {
+                Some(i) => i,
+                None => {
+                    out.push((from, Vec::new()));
+                    out.len() - 1
+                }
+            };
+            let b = &mut out[at].1;
+            b.extend_from_slice(&theirs.to_le_bytes());
+            b.extend_from_slice(&rec[8..]);
+        }
+        for (to, b) in out {
+            if let Some(l) = to.upgrade() {
+                l.mail.results.lock().unwrap().extend_from_slice(&b);
+                l.poke();
+            }
         }
     }
 
@@ -1375,8 +1570,10 @@ impl Core {
         };
         let now = self.now;
         let c = &mut self.conns[key];
+        c.dirty = true;
         if begin {
             let tx = NEXT_TX.fetch_add(1, Ordering::Relaxed);
+            TXS.lock().unwrap().insert(tx, self.me.clone());
             c.tx = Some(tx);
             c.used = now;
             let w = Wait::new(req.id, What::Begin(tx), deadline);
@@ -1479,6 +1676,9 @@ impl Core {
 
     fn close(&mut self, key: usize, why: Option<Fail>) {
         let mut c = self.take(key);
+        if let Some(tx) = c.tx {
+            end_tx(tx);
+        }
         if let Some(f) = why {
             c.fail_all(&f, &mut self.ready);
         }
@@ -1526,6 +1726,10 @@ impl Core {
             let l = &self.pools[&pid];
             if closed || !self.fresh_check(k) {
                 self.close(k, None);
+            } else if self.conns[k].dirty && shared.opts.reset {
+                // it is not empty now: it may go back after the reset
+                let now = self.now;
+                self.conns[k].reset(now, &mut self.ready);
             } else if others(l) && !(l.waiter && self.first_is_me(&shared)) {
                 self.park(k);
             } else {
@@ -1579,10 +1783,35 @@ impl Core {
     /// Like `fresh`, but does not close.
     fn fresh_check(&self, key: usize) -> bool {
         let c = &self.conns[key];
-        !c.shared
-            .opts
-            .conn_ttl
-            .is_some_and(|ttl| self.now.saturating_duration_since(c.last_io) > ttl)
+        let o = &c.shared.opts;
+        let quiet = self.now.saturating_duration_since(c.last_io);
+        if o.conn_ttl.is_some_and(|ttl| quiet > ttl) {
+            return false;
+        }
+        if c.max_age
+            .is_some_and(|a| self.now.saturating_duration_since(c.born) > a)
+        {
+            return false;
+        }
+        // inactive_connection_ttl: only over pool_min connections
+        !(o.inactive_ttl > Duration::ZERO
+            && quiet > o.inactive_ttl
+            && c.shared.state.lock().unwrap().total > o.min)
+    }
+
+    /// When an empty connection will be too old, for the timers.
+    fn ttl_due(&self, c: &Conn) -> Option<Instant> {
+        let o = &c.shared.opts;
+        let inactive = (o.inactive_ttl > Duration::ZERO).then_some(o.inactive_ttl);
+        [
+            o.conn_ttl.map(|t| c.last_io + t),
+            c.max_age.map(|a| c.born + a),
+            inactive.map(|t| c.last_io + t),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|&t| t > self.now)
+        .min()
     }
 
     fn first_is_me(&self, shared: &Shared) -> bool {
@@ -1611,6 +1840,14 @@ impl Core {
         }
         for id in late {
             self.fail(id, Fail::client(crate::TIMED_OUT));
+        }
+        // an empty connection that gets too old: wake then to close it
+        for (_, c) in self.conns.iter() {
+            if c.empty()
+                && let Some(t) = self.ttl_due(c)
+            {
+                soon(t);
+            }
         }
         let mut dead = Vec::new();
         for (k, c) in self.conns.iter_mut() {
@@ -1692,7 +1929,7 @@ impl Core {
             match c.sock.connected() {
                 Ok(false) => return,
                 Ok(true) => {
-                    c.sock.nodelay(c.shared.opts.nodelay);
+                    c.sock.tune(c.shared.opts.nodelay, c.shared.opts.keepalive);
                     c.phase = Phase::Greeting;
                     c.writable = false;
                     if let Err(e) =
@@ -1705,6 +1942,7 @@ impl Core {
                 Err(e) => {
                     let why = io_fail(format!("can not connect: {e}"));
                     if addrs.is_empty() {
+                        c.shared.resolve_later();
                         return self.close(k, Some(why));
                     }
                     let _ = registry.deregister(c.sock.source());
@@ -1717,7 +1955,10 @@ impl Core {
                             }
                             return;
                         }
-                        Err(f) => return self.close(k, Some(f)),
+                        Err(f) => {
+                            c.shared.resolve_later();
+                            return self.close(k, Some(f));
+                        }
                     }
                 }
             }
@@ -1750,6 +1991,7 @@ impl Core {
             l.full = false;
             l.failed = None;
         }
+        self.read_mail();
         self.turn();
         let ids: Vec<u64> = self.pools.keys().copied().collect();
         for pid in ids {
@@ -1757,14 +1999,29 @@ impl Core {
         }
         self.timers();
         self.flush_all();
+        self.route();
     }
 
     /// The isolate is gone: close all connections, leave all lists.
     fn shutdown(&mut self) {
+        // requests from other isolates fail: the transaction is closed
+        let reqs = {
+            let mut q = self.mail.reqs.lock().unwrap();
+            q.0 = true;
+            std::mem::take(&mut q.1)
+        };
+        for (mut req, from) in reqs {
+            self.next_foreign += 1;
+            let id = FOREIGN | self.next_foreign;
+            self.foreign.insert(id, (req.id, from));
+            req.id = id;
+            self.fail(id, Fail::client(TX_CLOSED));
+        }
         let keys: Vec<usize> = self.conns.iter().map(|(k, _)| k).collect();
         for k in keys {
-            self.close(k, None);
+            self.close(k, Some(Fail::client(TX_CLOSED)));
         }
+        self.route();
         for (_, l) in self.pools.drain() {
             if l.waiter {
                 l.shared.set_waiter(self.id, &self.me, false);
@@ -1796,6 +2053,7 @@ pub(crate) struct Link {
     stopped: AtomicBool,
     port: i64,
     id: u64,
+    mail: Arc<Mail>,
 }
 
 impl Link {
@@ -1942,6 +2200,7 @@ pub extern "C" fn dox_mysql_client(send_port: i64) -> i64 {
         poll.as_raw_fd()
     };
     let id = NEXT_LINK.fetch_add(1, Ordering::Relaxed);
+    let mail = Arc::new(Mail::default());
     let link = Arc::new_cyclic(|me| Link {
         core: Mutex::new(Core {
             poll,
@@ -1955,6 +2214,9 @@ pub extern "C" fn dox_mysql_client(send_port: i64) -> i64 {
             id,
             me: me.clone(),
             evs: Vec::new(),
+            mail: mail.clone(),
+            foreign: HashMap::new(),
+            next_foreign: 0,
         }),
         #[cfg(unix)]
         fd,
@@ -1968,6 +2230,7 @@ pub extern "C" fn dox_mysql_client(send_port: i64) -> i64 {
         stopped: AtomicBool::new(false),
         port: send_port,
         id,
+        mail,
     });
     let for_helper = link.clone();
     if std::thread::Builder::new()

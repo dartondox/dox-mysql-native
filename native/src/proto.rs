@@ -566,6 +566,11 @@ pub(crate) fn prepare(out: &mut Vec<u8>, sql: &[u8]) {
     end_packet(out, at, 0);
 }
 
+/// COM_RESET_CONNECTION. The server answers OK.
+pub(crate) fn reset(out: &mut Vec<u8>) {
+    packet(out, 0, &[0x1F]);
+}
+
 /// COM_STMT_CLOSE. The server sends no answer.
 pub(crate) fn close(out: &mut Vec<u8>, id: u32) {
     let at = start_packet(out);
