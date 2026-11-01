@@ -21,7 +21,9 @@ To see what is ready and what may still change, read [Status and roadmap](https:
 
 ## How it works
 
-- Rust ([mysql_async](https://docs.rs/mysql_async)) owns the connections and the pool.
+- A small MySQL client in Rust owns the connections. It runs on the thread of each isolate, so there is no extra thread in between.
+- The pool is for the whole process. Isolates that open the same settings share it, and `maxConnections` counts for all of them. A connection that one isolate does not use goes to an isolate that waits.
+- Many queries go down one connection at once (pipelining). The server answers them in order.
 - Your models and queries stay in Dart. You do not change any config.
 - Errors are `MysqlException`, with `message`, `code` and `sqlState`. For a server error, `code` is the MySQL error number (eg. 1062 for a duplicate key) and `sqlState` is the 5 character SQLSTATE. For other errors both are null.
 - Works with MySQL 8.4 (`caching_sha2_password` login) and MariaDB 11.
@@ -68,11 +70,21 @@ void main() async {
 ## Features
 
 - Many queries go to Rust in one call. Many results come back in one message.
-- Each connection keeps a prepared statement cache.
+- Each connection keeps a prepared statement cache (`statementCacheSize`, 32 by default). Over it, the statement used longest ago is closed.
+- TLS with rustls (`secure: true`). The login works with `caching_sha2_password` (also without TLS: the password goes RSA encrypted) and `mysql_native_password`.
+- A request waits at most 300 s. A transaction that gets no request for 300 s is rolled back.
 - `insertId` and `affectedRows` on each result.
 - Transactions: `pool.begin()`, `pool.commit(tx)`, `pool.rollback(tx)`.
 - Parameters as a list for `?`, or a map for `@name`.
 - Not yet: the `sha256_password` login, and the `timeZone` and `collation` options of the Dart driver.
+- A transaction id works only in the isolate that began it.
+
+## URL options
+
+`MysqlNativePool.fromUrl()` takes the URL options that mysql_async took, so old URLs still work.
+These change something: `pool_max`, `pool_min` (only checked), `stmt_cache_size`, `conn_ttl` (close a connection with no traffic for this many seconds), `socket`, `require_ssl`, `verify_ca`, `verify_identity`, `built_in_roots`, `client_found_rows`, `tcp_nodelay` and `enable_cleartext_plugin`.
+These are accepted and not used: `reset_connection`, `prefer_socket`, `secure_auth`, `inactive_connection_ttl`, `ttl_check_interval`, `abs_conn_ttl`, `abs_conn_ttl_jitter`, `tcp_keepalive`, `max_allowed_packet`, `wait_timeout` and `compression`.
+An unknown option is an error.
 
 ## Documentation
 
