@@ -616,6 +616,19 @@ fn time_text(neg: bool, days: u32, h: u8, m: u8, s: u8, us: u32) -> String {
 
 // ---- FFI ---------------------------------------------------------------
 
+/// The `len` bytes at `ptr`. Empty when `ptr` is null or `len` is 0 or
+/// negative, so a bad length from Dart can not read wild memory.
+///
+/// # Safety
+/// When `ptr` is not null and `len` > 0, `ptr` must point to `len`
+/// readable bytes.
+unsafe fn bytes<'a>(ptr: *const u8, len: i64) -> &'a [u8] {
+    if ptr.is_null() || len <= 0 {
+        return &[];
+    }
+    unsafe { std::slice::from_raw_parts(ptr, len as usize) }
+}
+
 /// ABI version of this library. Dart checks it at load.
 #[unsafe(no_mangle)]
 pub extern "C" fn dox_mysql_version() -> i32 {
@@ -637,6 +650,9 @@ pub unsafe extern "C" fn dox_mysql_init(data: *mut c_void) -> i32 {
         return -2; // DART_API_DL_MAJOR_VERSION
     }
     let mut entry = api.functions;
+    if entry.is_null() {
+        return -3;
+    }
     unsafe {
         while !(*entry).name.is_null() {
             if CStr::from_ptr((*entry).name).to_bytes() == b"Dart_PostCObject" {
@@ -657,10 +673,11 @@ pub unsafe extern "C" fn dox_mysql_init(data: *mut c_void) -> i32 {
 /// thread). Returns a handle (> 0), or -1 for a bad URL.
 ///
 /// # Safety
-/// `url` must point to `len` bytes.
+/// `url` must point to `len` bytes (a null `url` or a negative `len` is
+/// an empty URL).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dox_mysql_connect(url: *const u8, len: i64, _threads: i32) -> i64 {
-    let bytes = unsafe { std::slice::from_raw_parts(url, len as usize) };
+    let bytes = unsafe { bytes(url, len) };
     let Ok(url) = std::str::from_utf8(bytes) else {
         return -1;
     };
@@ -743,6 +760,21 @@ mod tests {
         assert!(!alive());
         // one more close does nothing
         dox_mysql_close(a);
+    }
+
+    #[test]
+    fn bad_ffi_lengths_and_null_pointers_are_empty() {
+        let b = b"abc";
+        unsafe {
+            assert_eq!(bytes(b.as_ptr(), 3), b"abc");
+            assert!(bytes(b.as_ptr(), -1).is_empty());
+            assert!(bytes(b.as_ptr(), i64::MIN).is_empty());
+            assert!(bytes(std::ptr::null(), 3).is_empty());
+            // a negative length or a null URL is a bad URL, not a crash
+            assert_eq!(dox_mysql_connect(b.as_ptr(), -1, 1), -1);
+            assert_eq!(dox_mysql_connect(std::ptr::null(), 10, 1), -1);
+            assert_eq!(dox_mysql_init(std::ptr::null_mut()), -1);
+        }
     }
 
     #[test]

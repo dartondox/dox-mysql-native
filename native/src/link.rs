@@ -2350,15 +2350,19 @@ pub extern "C" fn dox_mysql_client(send_port: i64) -> i64 {
 /// 0: the helper tells Dart when answers come.
 ///
 /// # Safety
-/// `link` must come from `dox_mysql_client`. `ptr` must point to `len`
-/// readable bytes. Only one call per link at a time (one isolate).
+/// `link` must come from `dox_mysql_client` (0 does nothing). `ptr` must
+/// point to `len` readable bytes (a null `ptr` or a negative `len` sends
+/// nothing). Only one call per link at a time (one isolate).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dox_mysql_submit(link: i64, ptr: *const u8, len: i64) -> i64 {
+    if link == 0 {
+        return 0;
+    }
     let s = unsafe { &*(link as *const Link) };
     if s.stopped.load(Ordering::Acquire) {
         return 0;
     }
-    let b = unsafe { std::slice::from_raw_parts(ptr, len.max(0) as usize) };
+    let b = unsafe { crate::bytes(ptr, len) };
     let mut core = s.core.lock().unwrap();
     core.submit(b);
     let has_ready = !core.ready.is_empty();
@@ -2381,10 +2385,19 @@ pub unsafe extern "C" fn dox_mysql_submit(link: i64, ptr: *const u8, len: i64) -
 /// bigger one).
 ///
 /// # Safety
-/// `link` must come from `dox_mysql_client`. `buf` must point to `cap`
-/// writable bytes. Only one call per link at a time (one isolate).
+/// `link` must come from `dox_mysql_client` (0 does nothing). `buf` must
+/// point to `cap` writable bytes (a null `buf` has room for 0 bytes).
+/// Only one call per link at a time (one isolate).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dox_mysql_run(link: i64, buf: *mut u8, cap: i64) -> i64 {
+    if link == 0 {
+        return 0;
+    }
+    let cap = if buf.is_null() {
+        0
+    } else {
+        cap.max(0) as usize
+    };
     let s = unsafe { &*(link as *const Link) };
     if s.stopped.load(Ordering::Acquire) {
         return 0;
@@ -2394,10 +2407,12 @@ pub unsafe extern "C" fn dox_mysql_run(link: i64, buf: *mut u8, cap: i64) -> i64
     core.service();
     let n = core.ready.len();
     s.set_due(core.next);
-    if n > cap.max(0) as usize {
+    if n > cap {
         return -(n as i64);
     }
-    unsafe { std::ptr::copy_nonoverlapping(core.ready.as_ptr(), buf, n) };
+    if n > 0 {
+        unsafe { std::ptr::copy_nonoverlapping(core.ready.as_ptr(), buf, n) };
+    }
     core.ready.clear();
     if core.ready.capacity() > BIG_BUF {
         core.ready = Vec::new(); // do not keep a big buffer forever
