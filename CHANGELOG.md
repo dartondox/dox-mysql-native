@@ -1,5 +1,6 @@
 ## Unreleased
 
+- Fixed wrong rows on MySQL 8.4 when the same SQL ran with a number param first and a text param later. MySQL keeps the param types of the first run of a prepared statement, so the text was compared as a number (`'zzz'` became 0 and matched `'taken@dox.dev'`). Now the statement cache key is the SQL plus the param types, so each set of types gets its own prepared statement. MariaDB was not affected.
 - Opening a pool is no longer a leaf FFI call. It looks up the host and connects, which can be slow. A leaf call blocks the safepoint of the isolate, so a GC in the other isolates had to wait.
 - `sslRootCert` (URL option `ssl_ca`) without `secure` (`require_ssl=true`) still does nothing, but now prints one warning on stderr that it is ignored because TLS is off.
 - A pool that can not open now says why. The `ArgumentError` still starts with `dox_mysql_native: bad connection config`, then the reason (eg. a bad URL option, or a TLS setup that can not work).

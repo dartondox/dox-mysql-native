@@ -132,6 +132,23 @@ void main() {
     await pool.execute('DROP TABLE mn_alter');
   });
 
+  // MySQL 8.4 keeps the param types of the first EXECUTE of a statement.
+  // Without the fix, 'zzz' was compared as a number (0) and found the row.
+  test('a cached statement run with an int, then with a string', () async {
+    await pool.execute(
+      'INSERT INTO mn_types (name) VALUES (?)',
+      parameters: <Object?>['taken@dox.dev'],
+    );
+    String sql = 'SELECT name FROM mn_types WHERE name IN (?)';
+    expect((await pool.query(sql, parameters: <Object?>[1])).rows, isEmpty);
+    expect((await pool.query(sql, parameters: <Object?>['zzz'])).rows, isEmpty);
+    expect((await pool.query(sql, parameters: <Object?>[1])).rows, isEmpty);
+    expect(
+      (await pool.query(sql, parameters: <Object?>['taken@dox.dev'])).rows,
+      hasLength(1),
+    );
+  });
+
   test('null values', () async {
     await pool.execute(
       'INSERT INTO mn_types (i) VALUES (?)',
