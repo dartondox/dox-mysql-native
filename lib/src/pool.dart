@@ -1,10 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi';
+import 'dart:io';
 import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:dox_mysql_native/src/bindings.dart';
+import 'package:ffi/ffi.dart';
 
 /// The result of one query.
 class MysqlNativeResult {
@@ -116,7 +118,8 @@ class MysqlNativePool {
         'stmt_cache_size': '$statementCacheSize',
         'conn_ttl': '${maxConnectionAge.inSeconds}',
         if (secure) 'require_ssl': 'true',
-        if (secure && sslRootCert != null) 'ssl_ca': sslRootCert,
+        // sent also without TLS, so fromUrl() can warn that it is ignored
+        'ssl_ca': ?sslRootCert,
         // only for a self-signed certificate in development
         if (secure && !verifyCertificate) ...<String, String>{
           'verify_ca': 'false',
@@ -139,15 +142,29 @@ class MysqlNativePool {
     if (!isAvailable) {
       throw UnsupportedError('dox_mysql_native is not available: $loadError');
     }
+    _warnIfCaIgnored(url);
     Uint8List bytes = utf8.encode(url);
-    Uint8List error = Uint8List(1024);
-    int handle = doxMysqlConnect(
-      bytes.address,
-      bytes.length,
-      threads,
-      error.address,
-      error.length,
-    );
+    const int errorCapacity = 1024;
+    // Native memory, not `.address`: the connect is not a leaf call (it
+    // looks up the host), and only a leaf call can take a Dart list. Zeroed,
+    // because the error text has no 0 at its end.
+    Pointer<Uint8> memory = calloc<Uint8>(bytes.length + errorCapacity);
+    int handle;
+    Uint8List error;
+    try {
+      memory.asTypedList(bytes.length).setAll(0, bytes);
+      Pointer<Uint8> errorPointer = memory + bytes.length;
+      handle = doxMysqlConnect(
+        memory,
+        bytes.length,
+        threads,
+        errorPointer,
+        errorCapacity,
+      );
+      error = Uint8List.fromList(errorPointer.asTypedList(errorCapacity));
+    } finally {
+      calloc.free(memory);
+    }
     if (handle <= 0) {
       int end = error.indexOf(0);
       String why = utf8.decode(
@@ -159,6 +176,23 @@ class MysqlNativePool {
       );
     }
     return MysqlNativePool.fromHandle(handle);
+  }
+
+  static bool _warnedCaIgnored = false;
+
+  /// `ssl_ca` does nothing without `require_ssl=true`. Says so on stderr,
+  /// once per isolate, so the CA file is not silently ignored.
+  static void _warnIfCaIgnored(String url) {
+    if (_warnedCaIgnored) return;
+    Map<String, String> query =
+        Uri.tryParse(url)?.queryParameters ?? <String, String>{};
+    if (query.containsKey('ssl_ca') && query['require_ssl'] != 'true') {
+      _warnedCaIgnored = true;
+      stderr.writeln(
+        'dox_mysql_native: warning: sslRootCert (ssl_ca) is ignored '
+        'because TLS is off (secure / require_ssl is not on).',
+      );
+    }
   }
 
   /// Runs [sql] and returns its rows.

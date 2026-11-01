@@ -301,6 +301,27 @@ void main() {
     );
   });
 
+  test('sslRootCert without secure warns once on stderr', () {
+    _Capture err = _Capture();
+    IOOverrides.runZoned(() {
+      for (int i = 0; i < 2; i++) {
+        MysqlNativePool.open(
+          host: Platform.environment['DB_HOST'] ?? '127.0.0.1',
+          port: int.parse(Platform.environment['DB_PORT'] ?? '3306'),
+          user: Platform.environment['DB_USER'] ?? 'root',
+          password: 'password',
+          database: 'dox-framework',
+          sslRootCert: '/no/such/ca.pem',
+        ).close();
+      }
+    }, stderr: () => err);
+    expect(
+      err.text.toString(),
+      'dox_mysql_native: warning: sslRootCert (ssl_ca) is ignored '
+      'because TLS is off (secure / require_ssl is not on).\n',
+    );
+  });
+
   test('bad params', () {
     expect(() => pool.query('SELECT 1', parameters: 1), throwsArgumentError);
   });
@@ -332,4 +353,15 @@ Future<int> _isolateWork(int handle) async {
     sum += r.rows.single['n'] as int;
   }
   return sum;
+}
+
+/// Catches what is written to stderr.
+class _Capture implements Stdout {
+  final StringBuffer text = StringBuffer();
+
+  @override
+  void writeln([Object? object = '']) => text.writeln(object);
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }

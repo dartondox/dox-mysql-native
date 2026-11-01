@@ -13,9 +13,12 @@ external int doxMysqlVersion();
 external int doxMysqlInit(Pointer<Void> dlData);
 
 /// Returns a pool handle (> 0), or -1: then the reason is in [error].
+///
+/// Not a leaf call: it looks up the host and connects, which can be slow.
+/// A leaf call would block the safepoint of this isolate, so a GC in the
+/// other isolates of the group would have to wait.
 @Native<Int64 Function(Pointer<Uint8>, Int64, Int32, Pointer<Uint8>, Int64)>(
   symbol: 'dox_mysql_connect',
-  isLeaf: true,
 )
 external int doxMysqlConnect(
   Pointer<Uint8> url,
