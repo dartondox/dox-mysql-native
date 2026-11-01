@@ -1,15 +1,17 @@
 //! Native MySQL and MariaDB driver for Dart (dox_mysql_native).
 //!
-//! Rust (mysql_async on tokio) owns the connections. Dart only encodes
-//! requests and decodes results.
+//! A small MySQL client in Rust runs on the thread of each Dart isolate
+//! (see `link.rs`). There is no runtime thread in between. Dart only
+//! encodes requests and decodes results.
 //!
-//! - One tokio runtime per process. Pools live in a registry, so all
-//!   isolates can share one pool (same URL = same pool).
-//! - Each isolate opens a client with its `ReceivePort`. Requests are sent
-//!   in batches with one leaf FFI call (`dox_mysql_submit`). Results are
-//!   added to a batch and posted to the port with `Dart_PostCObject`.
-//!   Results that finish at about the same time share one post.
-//! - mysql_async keeps a prepared statement cache per connection.
+//! - Pools live in a registry, so all isolates can share one pool (same
+//!   URL = same pool). The max connections count for the whole process.
+//! - Each isolate has one link: one mio poll and the connections it uses.
+//!   Requests go in batches with one leaf FFI call (`dox_mysql_submit`),
+//!   which writes them to the sockets at once. `dox_mysql_run` (a leaf
+//!   call) reads the answers that are there and writes the result records
+//!   into a Dart buffer. It never waits.
+//! - Each connection keeps a prepared statement cache with an LRU limit.
 //! - Each request has [TIMEOUT]. A transaction that gets no request for
 //!   [TIMEOUT] is rolled back, so its connection goes back to the pool.
 //!
@@ -28,20 +30,22 @@
 //!   Text, bytes and json are a u32 len and the bytes.
 //! - error: u16 server error code (0 for a client error), u8 kind
 //!   (0 server, 1 client), 5 bytes sqlstate, then the message (utf8).
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_int, c_void};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
-use mysql_async::consts::{ColumnFlags, ColumnType};
-use mysql_async::prelude::*;
-use mysql_async::{Column, Conn, Opts, Params, Pool, QueryResult, Value};
 use slab::Slab;
-use tokio::runtime::Runtime;
-use tokio::time::Instant;
+
+mod link;
+mod proto;
+mod tls;
+
+use proto::Value;
 
 /// Bump when the FFI functions or the record layout change.
-const ABI_VERSION: i32 = 1;
+const ABI_VERSION: i32 = 2;
 
 const OP_QUERY: u8 = 0;
 const OP_EXECUTE: u8 = 1;
@@ -61,6 +65,8 @@ const T_LONG_TEXT: u8 = 8;
 
 /// charset id of binary data (BLOB, VARBINARY, BINARY)
 const BINARY: u16 = 63;
+/// column flag of ENUM
+const ENUM_FLAG: u16 = 256;
 
 /// Size of the head of a result record.
 const RES_HEAD: usize = 16;
@@ -71,11 +77,7 @@ const RES_HEAD: usize = 16;
 /// ponytail: fixed. Make it a pool option when an app needs another value.
 const TIMEOUT: Duration = Duration::from_secs(300);
 const TIMED_OUT: &str = "dox_mysql_native: timeout, no answer in 300 s";
-
-/// A batch of this size or more goes to Dart without a copy (external
-/// typed data). A smaller one is copied: for a few bytes a copy is cheaper
-/// than a finalizer.
-const EXTERNAL_MIN: usize = 64 * 1024;
+const POOL_CLOSED: &str = "the pool is closed";
 
 // ---- Dart API DL -------------------------------------------------------
 // `NativeApi.initializeApiDLData` points to this table. We only need
@@ -94,10 +96,7 @@ struct DartApi {
     functions: *const ApiEntry,
 }
 
-type Finalizer = unsafe extern "C" fn(*mut c_void, *mut c_void);
-
-/// `Dart_CObject` for a `kTypedData` or `kExternalTypedData` (Uint8)
-/// value. 64-bit layout.
+/// `Dart_CObject` for a `kTypedData` (Uint8) value. 64-bit layout.
 #[repr(C)]
 struct DartCObject {
     ty: i32,
@@ -106,22 +105,14 @@ struct DartCObject {
     _pad2: i32,
     length: isize,
     values: *const u8,
-    /// external typed data only: who owns the bytes, and who frees them
-    peer: *mut c_void,
-    callback: Option<Finalizer>,
 }
 
 type PostFn = unsafe extern "C" fn(i64, *mut DartCObject) -> bool;
 static POST: OnceLock<PostFn> = OnceLock::new();
 
-/// Dart calls it when the external bytes of a post are not used any more.
-unsafe extern "C" fn free_bytes(_: *mut c_void, peer: *mut c_void) {
-    drop(unsafe { Box::from_raw(peer as *mut Vec<u8>) });
-}
-
-/// Posts bytes to a Dart port. A big batch moves to Dart without a copy,
-/// a small one is copied. False when the port is closed.
-fn post(port: i64, data: Vec<u8>) -> bool {
+/// Posts a few bytes to a Dart port (a copy). False when the port is
+/// closed. Only the idle helper threads post: never a leaf call.
+fn post(port: i64, data: &[u8]) -> bool {
     let Some(f) = POST.get() else { return false };
     let mut obj = DartCObject {
         ty: 7, // Dart_CObject_kTypedData
@@ -130,109 +121,214 @@ fn post(port: i64, data: Vec<u8>) -> bool {
         _pad2: 0,
         length: data.len() as isize,
         values: data.as_ptr(),
-        peer: std::ptr::null_mut(),
-        callback: None,
     };
-    if data.len() < EXTERNAL_MIN {
-        return unsafe { f(port, &mut obj) };
-    }
-    // the Vec moves into the box, its bytes stay where they are
-    let peer = Box::into_raw(Box::new(data));
-    obj.ty = 8; // Dart_CObject_kExternalTypedData
-    obj.peer = peer as *mut c_void;
-    obj.callback = Some(free_bytes);
-    let sent = unsafe { f(port, &mut obj) };
-    if !sent {
-        // not sent: the bytes are still ours to free
-        drop(unsafe { Box::from_raw(peer) });
-    }
-    sent
+    unsafe { f(port, &mut obj) }
 }
 
-// ---- registries --------------------------------------------------------
+// ---- options -----------------------------------------------------------
 
-/// worker threads of the runtime, set by the first `dox_mysql_connect`
-static THREADS: AtomicUsize = AtomicUsize::new(1);
+/// TLS settings from the URL.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct TlsOpts {
+    verify_ca: bool,
+    verify_identity: bool,
+    built_in_roots: bool,
+}
 
-fn runtime() -> &'static Runtime {
-    static RT: OnceLock<Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(THREADS.load(Ordering::Relaxed).max(1))
-            .thread_name("dox_mysql")
-            .enable_all()
-            .build()
-            .expect("tokio runtime")
-    })
+/// What a `mysql://` URL says, with the defaults of mysql_async.
+#[derive(Debug)]
+struct Opts {
+    host: String,
+    port: u16,
+    user: String,
+    pass: String,
+    db: Option<String>,
+    /// a Unix socket file instead of TCP
+    socket: Option<String>,
+    max: usize,
+    stmt_cache: usize,
+    /// a connection with no IO for this long is closed, not used
+    /// (`conn_ttl`, else `wait_timeout`, like mysql_async)
+    conn_ttl: Option<Duration>,
+    /// a connection older than this (plus a random part of `abs_jitter`)
+    /// is closed once it has no command
+    abs_ttl: Option<Duration>,
+    abs_jitter: Option<Duration>,
+    /// an idle connection over `min` closes after this long. 0: never.
+    inactive_ttl: Duration,
+    min: usize,
+    /// COM_RESET_CONNECTION when a connection has no command left
+    reset: bool,
+    keepalive: Option<Duration>,
+    tls: Option<TlsOpts>,
+    found_rows: bool,
+    nodelay: bool,
+    cleartext: bool,
+}
+
+/// Reads a `mysql://user:password@host:port/db?options` URL. It takes the
+/// options of mysql_async (see README.md), so old URLs still work. None:
+/// a bad URL or an unknown option, like mysql_async.
+fn parse_url(text: &str) -> Option<Opts> {
+    let url = url::Url::parse(text).ok()?;
+    if url.scheme() != "mysql" || url.cannot_be_a_base() {
+        return None;
+    }
+    let decode = |s: &str| {
+        percent_encoding::percent_decode_str(s)
+            .decode_utf8_lossy()
+            .into_owned()
+    };
+    let host = match url.host()? {
+        url::Host::Ipv6(a) => a.to_string(),
+        h => h.to_string(),
+    };
+    let db = url
+        .path_segments()
+        .and_then(|mut s| s.next())
+        .map(decode)
+        .filter(|d| !d.is_empty());
+    let mut o = Opts {
+        host,
+        port: url.port().unwrap_or(3306),
+        user: decode(url.username()),
+        pass: decode(url.password().unwrap_or("")),
+        db,
+        socket: None,
+        max: 100,
+        stmt_cache: 32,
+        conn_ttl: None,
+        abs_ttl: None,
+        abs_jitter: None,
+        inactive_ttl: Duration::ZERO,
+        min: 10,
+        reset: true,
+        keepalive: None,
+        tls: None,
+        found_rows: false,
+        nodelay: true,
+        cleartext: false,
+    };
+    let mut wait_timeout = None;
+    let mut tls = TlsOpts {
+        verify_ca: true,
+        verify_identity: true,
+        built_in_roots: true,
+    };
+    let mut require_ssl = false;
+    for (k, v) in url.query_pairs() {
+        let flag = || v.parse::<bool>().ok();
+        let num = || v.parse::<u64>().ok();
+        match &*k {
+            "pool_min" => o.min = num()? as usize,
+            "pool_max" => o.max = num()? as usize,
+            "stmt_cache_size" => o.stmt_cache = num()? as usize,
+            "conn_ttl" => o.conn_ttl = Some(Duration::from_secs(num()?)),
+            "socket" => o.socket = Some(v.into_owned()),
+            "require_ssl" => require_ssl = flag()?,
+            "verify_ca" => tls.verify_ca = flag()?,
+            "verify_identity" => tls.verify_identity = flag()?,
+            "built_in_roots" => tls.built_in_roots = flag()?,
+            "client_found_rows" => o.found_rows = flag()?,
+            "tcp_nodelay" => o.nodelay = flag()?,
+            "enable_cleartext_plugin" => o.cleartext = flag()?,
+            "reset_connection" => o.reset = flag()?,
+            "wait_timeout" => wait_timeout = Some(Duration::from_secs(num()?)),
+            "abs_conn_ttl" => o.abs_ttl = Some(Duration::from_secs(num()?)),
+            "abs_conn_ttl_jitter" => o.abs_jitter = Some(Duration::from_secs(num()?)),
+            "inactive_connection_ttl" => o.inactive_ttl = Duration::from_secs(num()?),
+            "tcp_keepalive" => o.keepalive = Some(Duration::from_millis(num()?)),
+            // known to mysql_async, not used here (see README.md)
+            "prefer_socket" | "secure_auth" => {
+                flag()?;
+            }
+            "ttl_check_interval" | "max_allowed_packet" => {
+                num()?;
+            }
+            "compression" => {}
+            _ => return None,
+        }
+    }
+    if o.max == 0 || o.min > o.max {
+        return None;
+    }
+    o.conn_ttl = o.conn_ttl.or(wait_timeout);
+    if require_ssl {
+        o.tls = Some(tls);
+    }
+    Some(o)
+}
+
+// ---- pools -------------------------------------------------------------
+
+/// A pool, shared by all isolates. The connections live in the links of
+/// the isolates that use them. A link gives back a connection with no
+/// command to `idle` when another isolate waits for one.
+struct Shared {
+    /// a number that is never used again, so a link can tell two pools
+    /// apart that got the same handle
+    id: u64,
+    url: String,
+    opts: Opts,
+    /// None without TLS
+    tls: Option<Arc<rustls::ClientConfig>>,
+    /// the addresses of the host, looked up when the pool opens and again
+    /// on a helper thread after a connect fails (so the isolate never
+    /// waits for DNS)
+    addrs: Mutex<Vec<std::net::SocketAddr>>,
+    resolving: AtomicBool,
+    state: Mutex<PoolState>,
+    /// how many links wait for a connection (`state.waiters.len()`)
+    waiting: AtomicUsize,
+    /// how many links want more connections (`state.hungry.len()`)
+    hungry: AtomicUsize,
+    /// the fair share of one link: max / active links, at least 1
+    share: AtomicUsize,
+    closed: AtomicBool,
+}
+
+#[derive(Default)]
+struct PoolState {
+    /// connections of this pool in the whole process (also the ones that
+    /// connect, and the ones in `idle`)
+    total: usize,
+    /// connections no link uses, with no command
+    idle: Vec<link::Conn>,
+    /// links that wait for a connection, first come first served
+    waiters: VecDeque<Weak<link::Link>>,
+    /// links that hold connections of this pool, and how many: they give
+    /// one back when another link waits
+    holders: HashMap<u64, (Weak<link::Link>, usize)>,
+    /// links that hold fewer than their fair share, are busy, and found
+    /// the pool full: links over their share give back to them
+    hungry: Vec<u64>,
 }
 
 struct PoolEntry {
-    url: String,
-    pool: Pool,
-    /// 0 not known yet, 1 MySQL, 2 MariaDB
-    maria: Arc<AtomicU8>,
-    /// how many opens use this pool. The last close disconnects it.
+    shared: Arc<Shared>,
+    /// how many opens use this pool. The last close closes it.
     refs: usize,
 }
 
-/// One isolate. Results wait in `out` until the next post.
-struct Client {
-    port: i64,
-    out: Mutex<(Vec<u8>, bool)>,
-}
-
-/// A transaction: one connection, taken from the pool until commit or
-/// rollback. The lock runs its queries one by one.
-struct TxConn {
-    conn: tokio::sync::Mutex<Conn>,
-    maria: bool,
-    /// the last request, to find a transaction that Dart left open
-    used: Mutex<Instant>,
-}
-
-impl TxConn {
-    fn touch(&self) {
-        *self.used.lock().unwrap() = Instant::now();
-    }
-}
-
-type Tx = Arc<TxConn>;
-
 static POOLS: Mutex<Slab<PoolEntry>> = Mutex::new(Slab::new());
-static CLIENTS: Mutex<Slab<Arc<Client>>> = Mutex::new(Slab::new());
-static TXS: Mutex<Slab<Tx>> = Mutex::new(Slab::new());
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// handles are slab keys + 1, so 0 is never a handle
-fn get<T: Clone>(slab: &Mutex<Slab<T>>, handle: u64) -> Option<T> {
+/// The pool of a handle (slab key + 1, so 0 is never a handle).
+fn pool_of(handle: u64) -> Option<Arc<Shared>> {
     let key = handle.checked_sub(1)? as usize;
-    slab.lock().unwrap().get(key).cloned()
-}
-
-fn pool_of(handle: u64) -> Result<(Pool, Arc<AtomicU8>), Fail> {
-    let key = handle.wrapping_sub(1) as usize;
-    let pools = POOLS.lock().unwrap();
-    let e = pools
-        .get(key)
-        .ok_or(Fail::Client("the pool is closed".into()))?;
-    Ok((e.pool.clone(), e.maria.clone()))
-}
-
-/// MariaDB keeps JSON in LONGTEXT, so Dart tries to decode its TEXT.
-/// Asked once per pool.
-async fn is_maria(conn: &mut Conn, flag: &AtomicU8) -> Result<bool, Fail> {
-    match flag.load(Ordering::Relaxed) {
-        1 => Ok(false),
-        2 => Ok(true),
-        _ => {
-            let v: Option<String> = conn.query_first("SELECT VERSION()").await?;
-            let maria = v.unwrap_or_default().contains("MariaDB");
-            flag.store(if maria { 2 } else { 1 }, Ordering::Relaxed);
-            Ok(maria)
-        }
-    }
+    POOLS.lock().unwrap().get(key).map(|e| e.shared.clone())
 }
 
 // ---- requests ----------------------------------------------------------
+
+#[derive(Clone, PartialEq, Debug)]
+enum Param {
+    Null,
+    Int(i64),
+    Double(f64),
+    /// text and bytes, both sent as VAR_STRING like mysql_async did
+    Bytes(Vec<u8>),
+}
 
 struct Request {
     id: u64,
@@ -240,7 +336,7 @@ struct Request {
     tx: u64,
     op: u8,
     sql: String,
-    params: Vec<Value>,
+    params: Vec<Param>,
 }
 
 /// Reads little endian values. Every read checks the length.
@@ -278,12 +374,12 @@ fn read_request(r: &mut Reader) -> Option<Request> {
     let mut params = Vec::with_capacity(count.min(1024));
     for _ in 0..count {
         params.push(match r.u8()? {
-            T_NULL => Value::NULL,
-            T_INT => Value::Int(r.u64()? as i64),
-            T_DOUBLE => Value::Double(f64::from_bits(r.u64()?)),
+            T_NULL => Param::Null,
+            T_INT => Param::Int(r.u64()? as i64),
+            T_DOUBLE => Param::Double(f64::from_bits(r.u64()?)),
             _ => {
                 let len = r.u32()? as usize;
-                Value::Bytes(r.take(len)?.to_vec())
+                Param::Bytes(r.take(len)?.to_vec())
             }
         });
     }
@@ -297,120 +393,20 @@ fn read_request(r: &mut Reader) -> Option<Request> {
     })
 }
 
+#[derive(Clone, Debug)]
 enum Fail {
-    Server(mysql_async::ServerError),
+    /// an ERR packet of the server
+    Server {
+        code: u16,
+        state: [u8; 5],
+        message: String,
+    },
     Client(String),
 }
 
-impl From<mysql_async::Error> for Fail {
-    fn from(e: mysql_async::Error) -> Self {
-        match e {
-            mysql_async::Error::Server(s) => Fail::Server(s),
-            other => Fail::Client(other.to_string()),
-        }
-    }
-}
-
-async fn run(req: Request) -> Result<Vec<u8>, Fail> {
-    match req.op {
-        OP_BEGIN => {
-            let (pool, flag) = pool_of(req.pool)?;
-            let mut conn = pool.get_conn().await?;
-            let maria = is_maria(&mut conn, &flag).await?;
-            conn.query_drop("START TRANSACTION").await?;
-            let tx = Arc::new(TxConn {
-                conn: tokio::sync::Mutex::new(conn),
-                maria,
-                used: Mutex::new(Instant::now()),
-            });
-            let key = TXS.lock().unwrap().insert(tx.clone());
-            // weak: a commit must give the connection back to the pool now,
-            // not when the watch wakes up
-            tokio::spawn(watch(key, Arc::downgrade(&tx)));
-            Ok(ok_head(0, key as u64 + 1))
-        }
-        OP_COMMIT | OP_ROLLBACK => {
-            let key = req.tx.wrapping_sub(1) as usize;
-            let tx = TXS
-                .lock()
-                .unwrap()
-                .try_remove(key)
-                .ok_or(Fail::Client("transaction is closed".into()))?;
-            let mut conn = tx.conn.lock().await;
-            let sql = if req.op == OP_COMMIT {
-                "COMMIT"
-            } else {
-                "ROLLBACK"
-            };
-            conn.query_drop(sql).await?;
-            Ok(ok_head(0, 0))
-        }
-        OP_QUERY | OP_EXECUTE => {
-            let rows = req.op == OP_QUERY;
-            if req.tx != 0 {
-                let tx = get(&TXS, req.tx).ok_or(Fail::Client("transaction is closed".into()))?;
-                tx.touch();
-                let mut conn = tx.conn.lock().await;
-                let out = exec(&mut conn, &req.sql, req.params, rows, tx.maria).await;
-                tx.touch();
-                out
-            } else {
-                let (pool, flag) = pool_of(req.pool)?;
-                let mut conn = pool.get_conn().await?;
-                let maria = is_maria(&mut conn, &flag).await?;
-                exec(&mut conn, &req.sql, req.params, rows, maria).await
-            }
-        }
-        op => Err(Fail::Client(format!("unknown op {op}"))),
-    }
-}
-
-/// Rolls back transaction `key` when Dart sends it no request for
-/// [TIMEOUT] (eg. its isolate is gone), so the pool does not run dry.
-async fn watch(key: usize, weak: std::sync::Weak<TxConn>) {
-    loop {
-        // gone: committed or rolled back, and the connection is back
-        let Some(tx) = weak.upgrade() else { return };
-        let due = *tx.used.lock().unwrap() + TIMEOUT;
-        drop(tx);
-        tokio::time::sleep_until(due).await;
-        let Some(tx) = weak.upgrade() else { return };
-        let open = {
-            let mut txs = TXS.lock().unwrap();
-            let same = txs.get(key).is_some_and(|t| Arc::ptr_eq(t, &tx));
-            if same && tx.conn.try_lock().is_err() {
-                // a query runs right now, and it has its own timeout
-                tx.touch();
-                continue;
-            }
-            if same && *tx.used.lock().unwrap() + TIMEOUT > Instant::now() {
-                continue; // a request came meanwhile
-            }
-            same && txs.try_remove(key).is_some()
-        };
-        if open {
-            let mut conn = tx.conn.lock().await;
-            let _ = tokio::time::timeout(TIMEOUT, conn.query_drop("ROLLBACK")).await;
-        }
-        return;
-    }
-}
-
-/// No params: text protocol, one round trip. Params: prepared statement,
-/// cached per connection by mysql_async.
-async fn exec(
-    conn: &mut Conn,
-    sql: &str,
-    params: Vec<Value>,
-    rows: bool,
-    maria: bool,
-) -> Result<Vec<u8>, Fail> {
-    if params.is_empty() {
-        let res = conn.query_iter(sql).await?;
-        read(res, rows, maria).await
-    } else {
-        let res = conn.exec_iter(sql, Params::Positional(params)).await?;
-        read(res, rows, maria).await
+impl Fail {
+    fn client(msg: &str) -> Fail {
+        Fail::Client(msg.to_string())
     }
 }
 
@@ -426,47 +422,33 @@ fn ok_head(affected: u64, insert_id: u64) -> Vec<u8> {
     out
 }
 
-/// Encodes the first result set. More result sets (multi statements) are
-/// read and dropped.
-async fn read<P: Protocol>(
-    mut res: QueryResult<'_, '_, P>,
-    rows: bool,
-    maria: bool,
-) -> Result<Vec<u8>, Fail> {
-    let cols: Arc<[Column]> = res.columns().unwrap_or_else(|| Arc::from(Vec::new()));
-    let mut out = ok_head(0, 0);
-    let kinds: Vec<Kind> = cols
-        .iter()
-        .map(|c| match kind_of(c) {
-            Kind::LongText if !maria => Kind::Text,
-            kind => kind,
-        })
-        .collect();
-    let mut count: u32 = 0;
-    let b = RES_HEAD;
-    if rows {
-        out[b + 16..b + 20].copy_from_slice(&(cols.len() as u32).to_le_bytes());
-        for c in cols.iter() {
-            let name = c.name_ref();
-            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
-            out.extend_from_slice(name);
+/// The whole result record. An ok body already has room for the head.
+fn record(id: u64, result: Result<Vec<u8>, Fail>) -> Vec<u8> {
+    let (status, mut out) = match result {
+        Ok(out) => (0u8, out),
+        Err(fail) => {
+            let (code, kind, state, msg) = match fail {
+                Fail::Server {
+                    code,
+                    state,
+                    message,
+                } => (code, 0u8, state, message),
+                Fail::Client(msg) => (0, 1, *b"HY000", msg),
+            };
+            let mut out = Vec::with_capacity(RES_HEAD + 8 + msg.len());
+            out.extend_from_slice(&[0; RES_HEAD]);
+            out.extend_from_slice(&code.to_le_bytes());
+            out.push(kind);
+            out.extend_from_slice(&state);
+            out.extend_from_slice(msg.as_bytes());
+            (1, out)
         }
-    }
-    while let Some(row) = res.next().await? {
-        if rows {
-            for (value, kind) in row.unwrap().into_iter().zip(&kinds) {
-                cell(&mut out, *kind, value);
-            }
-            count += 1;
-        }
-    }
-    let affected = res.affected_rows();
-    let insert_id = res.last_insert_id().unwrap_or(0);
-    res.drop_result().await?;
-    out[b..b + 8].copy_from_slice(&affected.to_le_bytes());
-    out[b + 8..b + 16].copy_from_slice(&insert_id.to_le_bytes());
-    out[b + 20..b + 24].copy_from_slice(&count.to_le_bytes());
-    Ok(out)
+    };
+    let len = (out.len() - RES_HEAD) as u32;
+    out[0..8].copy_from_slice(&id.to_le_bytes());
+    out[8..12].copy_from_slice(&[status, 0, 0, 0]);
+    out[12..16].copy_from_slice(&len.to_le_bytes());
+    out
 }
 
 // ---- values ------------------------------------------------------------
@@ -485,34 +467,32 @@ enum Kind {
     Time,
 }
 
-fn kind_of(c: &Column) -> Kind {
-    use ColumnType::*;
-    let binary = c.character_set() == BINARY;
-    match c.column_type() {
+/// The kind of a column from its definition: type, charset, length, flags.
+fn kind_of(ty: u8, charset: u16, length: u32, flags: u16) -> Kind {
+    let binary = charset == BINARY;
+    match ty {
         // TINYINT(1), used by boolean()
-        MYSQL_TYPE_TINY if c.column_length() == 1 => Kind::Bool,
-        MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT | MYSQL_TYPE_LONG | MYSQL_TYPE_LONGLONG
-        | MYSQL_TYPE_INT24 | MYSQL_TYPE_YEAR => Kind::Int,
-        MYSQL_TYPE_FLOAT | MYSQL_TYPE_DOUBLE | MYSQL_TYPE_DECIMAL | MYSQL_TYPE_NEWDECIMAL => {
-            Kind::Double
-        }
-        MYSQL_TYPE_DATE
-        | MYSQL_TYPE_NEWDATE
-        | MYSQL_TYPE_DATETIME
-        | MYSQL_TYPE_DATETIME2
-        | MYSQL_TYPE_TIMESTAMP
-        | MYSQL_TYPE_TIMESTAMP2 => Kind::Date,
-        MYSQL_TYPE_TIME | MYSQL_TYPE_TIME2 => Kind::Time,
-        MYSQL_TYPE_JSON => Kind::Json,
-        MYSQL_TYPE_TINY_BLOB | MYSQL_TYPE_MEDIUM_BLOB | MYSQL_TYPE_LONG_BLOB | MYSQL_TYPE_BLOB => {
+        1 if length == 1 => Kind::Bool,
+        // TINY, SHORT, LONG, LONGLONG, INT24, YEAR
+        1 | 2 | 3 | 8 | 9 | 13 => Kind::Int,
+        // FLOAT, DOUBLE, DECIMAL, NEWDECIMAL
+        4 | 5 | 0 | 246 => Kind::Double,
+        // DATE, NEWDATE, DATETIME, DATETIME2, TIMESTAMP, TIMESTAMP2
+        10 | 14 | 12 | 18 | 7 | 17 => Kind::Date,
+        // TIME, TIME2
+        11 | 19 => Kind::Time,
+        245 => Kind::Json,
+        // TINY_BLOB, MEDIUM_BLOB, LONG_BLOB, BLOB
+        249..=252 => {
             if binary {
                 Kind::Bytes
             } else {
                 Kind::LongText
             }
         }
-        MYSQL_TYPE_BIT | MYSQL_TYPE_GEOMETRY => Kind::Bytes,
-        _ if binary && !c.flags().contains(ColumnFlags::ENUM_FLAG) => Kind::Bytes,
+        // BIT, GEOMETRY
+        16 | 255 => Kind::Bytes,
+        _ if binary && flags & ENUM_FLAG == 0 => Kind::Bytes,
         _ => Kind::Text,
     }
 }
@@ -539,7 +519,7 @@ fn put_text(out: &mut Vec<u8>, s: &str) {
 
 fn cell(out: &mut Vec<u8>, kind: Kind, value: Value) {
     match (kind, value) {
-        (_, Value::NULL) => out.push(T_NULL),
+        (_, Value::Null) => out.push(T_NULL),
         (Kind::Bool, Value::Int(v)) => out.extend_from_slice(&[T_BOOL, (v != 0) as u8]),
         (Kind::Bool, Value::UInt(v)) => out.extend_from_slice(&[T_BOOL, (v != 0) as u8]),
         (Kind::Bool, Value::Bytes(b)) => out.extend_from_slice(&[T_BOOL, (b != b"0") as u8]),
@@ -555,25 +535,25 @@ fn cell(out: &mut Vec<u8>, kind: Kind, value: Value) {
             put_text(out, &time_text(neg, days, h, m, s, us))
         }
         (Kind::Int, Value::Bytes(b)) => {
-            match std::str::from_utf8(&b).ok().and_then(|s| s.parse().ok()) {
+            match std::str::from_utf8(b).ok().and_then(|s| s.parse().ok()) {
                 Some(v) => put_int(out, v),
-                None => put_bytes(out, T_TEXT, &b),
+                None => put_bytes(out, T_TEXT, b),
             }
         }
         (Kind::Double, Value::Bytes(b)) => {
-            match std::str::from_utf8(&b).ok().and_then(|s| s.parse().ok()) {
+            match std::str::from_utf8(b).ok().and_then(|s| s.parse().ok()) {
                 Some(v) => put_double(out, v),
-                None => put_bytes(out, T_TEXT, &b),
+                None => put_bytes(out, T_TEXT, b),
             }
         }
-        (Kind::Date, Value::Bytes(b)) => match parse_date(&b) {
+        (Kind::Date, Value::Bytes(b)) => match parse_date(b) {
             Some((y, mo, d, h, mi, s, us)) => date(out, y, mo, d, h, mi, s, us),
-            None => put_bytes(out, T_TEXT, &b),
+            None => put_bytes(out, T_TEXT, b),
         },
-        (Kind::Json, Value::Bytes(b)) => put_bytes(out, T_JSON, &b),
-        (Kind::LongText, Value::Bytes(b)) => put_bytes(out, T_LONG_TEXT, &b),
-        (Kind::Bytes, Value::Bytes(b)) => put_bytes(out, T_BYTES, &b),
-        (_, Value::Bytes(b)) => put_bytes(out, T_TEXT, &b),
+        (Kind::Json, Value::Bytes(b)) => put_bytes(out, T_JSON, b),
+        (Kind::LongText, Value::Bytes(b)) => put_bytes(out, T_LONG_TEXT, b),
+        (Kind::Bytes, Value::Bytes(b)) => put_bytes(out, T_BYTES, b),
+        (_, Value::Bytes(b)) => put_bytes(out, T_TEXT, b),
     }
 }
 
@@ -634,63 +614,6 @@ fn time_text(neg: bool, days: u32, h: u8, m: u8, s: u8, us: u32) -> String {
     }
 }
 
-// ---- results back to Dart ----------------------------------------------
-
-/// The whole result record. An ok body already has room for the head.
-fn record(id: u64, result: Result<Vec<u8>, Fail>) -> Vec<u8> {
-    let (status, mut out) = match result {
-        Ok(out) => (0u8, out),
-        Err(fail) => {
-            let (code, kind, state, msg) = match fail {
-                Fail::Server(e) => (e.code, 0u8, e.state, e.message),
-                Fail::Client(msg) => (0, 1, "HY000".to_string(), msg),
-            };
-            let mut out = Vec::with_capacity(RES_HEAD + 8 + msg.len());
-            out.extend_from_slice(&[0; RES_HEAD]);
-            out.extend_from_slice(&code.to_le_bytes());
-            out.push(kind);
-            let mut st = [b' '; 5];
-            for (d, c) in st.iter_mut().zip(state.bytes()) {
-                *d = c;
-            }
-            out.extend_from_slice(&st);
-            out.extend_from_slice(msg.as_bytes());
-            (1, out)
-        }
-    };
-    let len = (out.len() - RES_HEAD) as u32;
-    out[0..8].copy_from_slice(&id.to_le_bytes());
-    out[8..12].copy_from_slice(&[status, 0, 0, 0]);
-    out[12..16].copy_from_slice(&len.to_le_bytes());
-    out
-}
-
-impl Client {
-    /// Adds a result. The first result of a batch posts the batch after
-    /// one yield, so results that finish meanwhile go in the same post.
-    async fn deliver(&self, rec: Vec<u8>) {
-        let first = {
-            let mut out = self.out.lock().unwrap();
-            if out.0.is_empty() {
-                out.0 = rec; // the first result of a batch: no copy
-            } else {
-                out.0.extend_from_slice(&rec);
-            }
-            !std::mem::replace(&mut out.1, true)
-        };
-        if !first {
-            return;
-        }
-        tokio::task::yield_now().await;
-        let batch = {
-            let mut out = self.out.lock().unwrap();
-            out.1 = false;
-            std::mem::take(&mut out.0)
-        };
-        post(self.port, batch);
-    }
-}
-
 // ---- FFI ---------------------------------------------------------------
 
 /// ABI version of this library. Dart checks it at load.
@@ -727,43 +650,64 @@ pub unsafe extern "C" fn dox_mysql_init(data: *mut c_void) -> i32 {
     -3
 }
 
-/// Opens a pool for a `mysql://` URL (see mysql_async `Opts::from_url`).
-/// It connects lazily, on the first query. The same URL gives the same
-/// pool, so isolates share it. Each open needs one [dox_mysql_close].
-/// [threads] is the size of the runtime of the
-/// whole process: only the first call sets it. Returns a handle (> 0), or
-/// -1 for a bad URL.
+/// Opens a pool for a `mysql://` URL (it takes the options of mysql_async,
+/// see README.md). It connects lazily, on the first query. The same URL
+/// gives the same pool, so isolates share it. Each open needs one
+/// [dox_mysql_close]. `_threads` is not used any more (there is no runtime
+/// thread). Returns a handle (> 0), or -1 for a bad URL.
 ///
 /// # Safety
 /// `url` must point to `len` bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dox_mysql_connect(url: *const u8, len: i64, threads: i32) -> i64 {
+pub unsafe extern "C" fn dox_mysql_connect(url: *const u8, len: i64, _threads: i32) -> i64 {
     let bytes = unsafe { std::slice::from_raw_parts(url, len as usize) };
     let Ok(url) = std::str::from_utf8(bytes) else {
         return -1;
     };
     let mut pools = POOLS.lock().unwrap();
-    if let Some((key, entry)) = pools.iter_mut().find(|(_, e)| e.url == url) {
+    if let Some((key, entry)) = pools.iter_mut().find(|(_, e)| e.shared.url == url) {
         entry.refs += 1;
         return key as i64 + 1;
     }
-    let Ok(opts) = Opts::from_url(url) else {
+    let Some(opts) = parse_url(url) else {
         return -1;
     };
-    THREADS.store(threads.max(1) as usize, Ordering::Relaxed);
-    // Pool::new spawns a task, so it needs the runtime
-    let _guard = runtime().enter();
+    let tls = match opts.tls {
+        Some(t) => match tls::config(t) {
+            Some(c) => Some(c),
+            None => return -1,
+        },
+        None => None,
+    };
+    // the one DNS lookup that blocks: when the pool opens. Empty when it
+    // fails: the first connect then looks up again on a helper thread.
+    let addrs = match opts.socket {
+        Some(_) => Vec::new(),
+        None => link::resolve(&opts.host, opts.port).unwrap_or_default(),
+    };
+    let opts_max = opts.max;
     let key = pools.insert(PoolEntry {
-        url: url.to_string(),
-        pool: Pool::new(opts),
-        maria: Arc::new(AtomicU8::new(0)),
+        shared: Arc::new(Shared {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            url: url.to_string(),
+            opts,
+            tls,
+            addrs: Mutex::new(addrs),
+            resolving: AtomicBool::new(false),
+            state: Mutex::new(PoolState::default()),
+            waiting: AtomicUsize::new(0),
+            hungry: AtomicUsize::new(0),
+            share: AtomicUsize::new(opts_max),
+            closed: AtomicBool::new(false),
+        }),
         refs: 1,
     });
     key as i64 + 1
 }
 
-/// Gives back one open of a pool. The last one disconnects the pool for
-/// every isolate. Running queries finish.
+/// Gives back one open of a pool. The last one closes the pool for every
+/// isolate: its idle connections close now, the others once their running
+/// queries finish. New requests fail with "the pool is closed".
 #[unsafe(no_mangle)]
 pub extern "C" fn dox_mysql_close(handle: i64) {
     let Some(key) = (handle as u64).checked_sub(1) else {
@@ -777,58 +721,9 @@ pub extern "C" fn dox_mysql_close(handle: i64) {
     if entry.refs > 0 {
         return;
     }
-    let entry = pools.remove(key as usize);
+    let shared = pools.remove(key as usize).shared;
     drop(pools);
-    runtime().spawn(async move {
-        let _ = entry.pool.disconnect().await;
-    });
-}
-
-/// Opens a client: results are posted to `send_port`. Returns a handle,
-/// or -1 when `dox_mysql_init` did not run.
-#[unsafe(no_mangle)]
-pub extern "C" fn dox_mysql_client(send_port: i64) -> i64 {
-    if POST.get().is_none() {
-        return -1;
-    }
-    let client = Arc::new(Client {
-        port: send_port,
-        out: Mutex::new((Vec::new(), false)),
-    });
-    CLIENTS.lock().unwrap().insert(client) as i64 + 1
-}
-
-/// Closes a client. Results that come later are dropped.
-#[unsafe(no_mangle)]
-pub extern "C" fn dox_mysql_client_close(handle: i64) {
-    if let Some(key) = (handle as u64).checked_sub(1) {
-        CLIENTS.lock().unwrap().try_remove(key as usize);
-    }
-}
-
-/// Runs a batch of request records. Each result is posted to the port of
-/// the client. Copies the bytes, so Dart can reuse its buffer.
-///
-/// # Safety
-/// `ptr` must point to `len` bytes.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dox_mysql_submit(client: i64, ptr: *const u8, len: i64) {
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-    let Some(client) = get(&CLIENTS, client as u64) else {
-        return;
-    };
-    let mut r = Reader(bytes);
-    let rt = runtime();
-    while let Some(req) = read_request(&mut r) {
-        let client = client.clone();
-        rt.spawn(async move {
-            let id = req.id;
-            let result = tokio::time::timeout(TIMEOUT, run(req))
-                .await
-                .unwrap_or_else(|_| Err(Fail::Client(TIMED_OUT.into())));
-            client.deliver(record(id, result)).await;
-        });
-    }
+    link::close_pool(&shared);
 }
 
 #[cfg(test)]
@@ -851,13 +746,48 @@ mod tests {
     }
 
     #[test]
+    fn urls() {
+        let o = parse_url(
+            "mysql://us%40er:p%40ss%2Bw@[::1]:3307/my%2Ddb?pool_min=2&pool_max=5\
+             &stmt_cache_size=8&conn_ttl=60&require_ssl=true&verify_ca=false\
+             &reset_connection=false&prefer_socket=false",
+        )
+        .unwrap();
+        assert_eq!((o.user.as_str(), o.pass.as_str()), ("us@er", "p@ss+w"));
+        assert_eq!((o.host.as_str(), o.port), ("::1", 3307));
+        assert_eq!(o.db.as_deref(), Some("my-db"));
+        assert_eq!((o.max, o.stmt_cache), (5, 8));
+        assert_eq!(o.conn_ttl, Some(Duration::from_secs(60)));
+        assert!(!o.reset);
+        assert!(!o.tls.unwrap().verify_ca && o.tls.unwrap().verify_identity);
+        let o = parse_url(
+            "mysql://u@h/d?wait_timeout=7&abs_conn_ttl=9&tcp_keepalive=1500\
+             &inactive_connection_ttl=3&compression=fast",
+        )
+        .unwrap();
+        assert_eq!(o.conn_ttl, Some(Duration::from_secs(7)));
+        assert_eq!(o.abs_ttl, Some(Duration::from_secs(9)));
+        assert_eq!(o.keepalive, Some(Duration::from_millis(1500)));
+        assert_eq!(o.inactive_ttl, Duration::from_secs(3));
+        assert!(o.reset);
+        let o = parse_url("mysql://root@localhost/db?socket=/tmp/my.sock").unwrap();
+        assert_eq!(o.socket.as_deref(), Some("/tmp/my.sock"));
+        assert_eq!((o.port, o.max, o.tls), (3306, 100, None));
+        // like mysql_async: unknown options and bad values are errors
+        assert!(parse_url("mysql://root@localhost/db?nope=1").is_none());
+        assert!(parse_url("mysql://root@localhost/db?pool_max=x").is_none());
+        assert!(parse_url("mysql://root@localhost/db?pool_min=5&pool_max=2").is_none());
+        assert!(parse_url("postgres://root@localhost/db").is_none());
+    }
+
+    #[test]
     fn records_have_the_head_in_front() {
         let ok = record(7, Ok(ok_head(3, 4)));
         assert_eq!(u64::from_le_bytes(ok[0..8].try_into().unwrap()), 7);
         assert_eq!(ok[8], 0);
         assert_eq!(u32::from_le_bytes(ok[12..16].try_into().unwrap()), 24);
         assert_eq!(u64::from_le_bytes(ok[16..24].try_into().unwrap()), 3);
-        let err = record(8, Err(Fail::Client("boom".into())));
+        let err = record(8, Err(Fail::client("boom")));
         assert_eq!(err[8], 1);
         assert_eq!(u32::from_le_bytes(err[12..16].try_into().unwrap()), 12);
         assert_eq!(&err[16 + 8..], b"boom");
@@ -881,6 +811,18 @@ mod tests {
     }
 
     #[test]
+    fn kinds() {
+        assert_eq!(kind_of(1, 63, 1, 0), Kind::Bool);
+        assert_eq!(kind_of(1, 63, 4, 0), Kind::Int);
+        assert_eq!(kind_of(246, 63, 10, 0), Kind::Double);
+        assert_eq!(kind_of(252, 45, 0, 0), Kind::LongText);
+        assert_eq!(kind_of(252, 63, 0, 0), Kind::Bytes);
+        assert_eq!(kind_of(254, 63, 0, 0), Kind::Bytes);
+        assert_eq!(kind_of(254, 63, 0, ENUM_FLAG), Kind::Text);
+        assert_eq!(kind_of(253, 45, 0, 0), Kind::Text);
+    }
+
+    #[test]
     fn requests() {
         let mut b = Vec::new();
         b.extend_from_slice(&7u64.to_le_bytes());
@@ -901,7 +843,7 @@ mod tests {
         assert_eq!(req.sql, "SELECT ?");
         assert_eq!(
             req.params,
-            vec![Value::Int(5), Value::Bytes(b"hi".to_vec())]
+            vec![Param::Int(5), Param::Bytes(b"hi".to_vec())]
         );
         assert!(read_request(&mut r).is_none());
         // a cut record is ignored

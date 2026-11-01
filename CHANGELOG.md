@@ -1,3 +1,17 @@
+## Unreleased
+
+- The Rust client now runs on the thread of each isolate. Before, every query went to a tokio thread and back (mysql_async). Now a small MySQL client in Rust writes the query to the socket in the same call, and reads the answer when Dart runs next. An idle helper thread wakes Dart only when it is idle and an answer comes. The same change made the Postgres driver about 2 times faster.
+- Queries are pipelined: many go down one connection at once, and the server answers them in order. Each query still fails on its own.
+- The pool is still one per process (same settings = same pool), and `maxConnections` still counts for the whole process. A connection that one isolate does not use goes to an isolate that waits. A busy isolate can not starve the others, and busy isolates share the connections fairly.
+- An isolate that dies (eg. it ends without `close()`) gives its connections back at once. Its open transactions roll back.
+- The prepared statement cache has an LRU limit (`statementCacheSize`). The statement used longest ago is closed on the server.
+- `threads` of `MysqlNativePool.open()` and `fromUrl()` does nothing any more. There is no runtime thread to size.
+- A transaction id still works in every isolate. A request from another isolate goes to the isolate that began the transaction, and the answer comes back.
+- mysql_async and tokio are gone. TLS is rustls with ring, like before. The URL options of mysql_async still work (see the README). A few do nothing now; the README says which and why.
+- The host is looked up when the pool opens. When a connect fails, it is looked up again on a helper thread, so a new address (eg. after a failover) is used. The isolate never waits for DNS.
+- The native ABI version is now 2.
+- New `tool/stress.dart`: many isolates, transactions (also across isolates), statement cache churn, errors and a killer that ends random connections. Any request over 2 s counts as a hang.
+
 ## 3.0.0
 
 - The first stable release.

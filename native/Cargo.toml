@@ -8,10 +8,23 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-# rustls + ring for TLS, flate2 in pure Rust: no system libraries needed
-mysql_async = { version = "0.37.1", default-features = false, features = ["default-rustls-ring"] }
+mio = { version = "1.2.4", features = ["os-poll", "net"] }
+percent-encoding = "2.3.2"
+# caching_sha2_password without TLS: the password goes RSA encrypted.
+# rsa 0.9 is the newest stable, and its OAEP needs sha1 0.10.
+rsa = { version = "0.9.10", features = ["getrandom"] }
+sha1 = "0.10.6"
+# rustls + ring for TLS (ring also gives the SHA hashes of the login)
+ring = "0.17.14"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 slab = "0.4.12"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+socket2 = "0.6.5"
+# the URL parser mysql_async used, so the same URLs work
+url = "2.5.8"
+webpki-roots = "1.0.11"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"
 
 [profile.release]
 opt-level = 3

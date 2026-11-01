@@ -21,7 +21,9 @@ To see what is ready and what may still change, read [Status and roadmap](https:
 
 ## How it works
 
-- Rust ([mysql_async](https://docs.rs/mysql_async)) owns the connections and the pool.
+- A small MySQL client in Rust owns the connections. It runs on the thread of each isolate, so there is no extra thread in between.
+- The pool is for the whole process. Isolates that open the same settings share it, and `maxConnections` counts for all of them. A connection that one isolate does not use goes to an isolate that waits, and busy isolates get a fair share each.
+- Many queries go down one connection at once (pipelining). The server answers them in order.
 - Your models and queries stay in Dart. You do not change any config.
 - Errors are `MysqlException`, with `message`, `code` and `sqlState`. For a server error, `code` is the MySQL error number (eg. 1062 for a duplicate key) and `sqlState` is the 5 character SQLSTATE. For other errors both are null.
 - Works with MySQL 8.4 (`caching_sha2_password` login) and MariaDB 11.
@@ -68,11 +70,30 @@ void main() async {
 ## Features
 
 - Many queries go to Rust in one call. Many results come back in one message.
-- Each connection keeps a prepared statement cache.
+- Each connection keeps a prepared statement cache (`statementCacheSize`, 32 by default). Over it, the statement used longest ago is closed.
+- TLS with rustls (`secure: true`). The login works with `caching_sha2_password` (also without TLS: the password goes RSA encrypted) and `mysql_native_password`.
+- A request waits at most 300 s. A transaction that gets no request for 300 s is rolled back.
 - `insertId` and `affectedRows` on each result.
 - Transactions: `pool.begin()`, `pool.commit(tx)`, `pool.rollback(tx)`.
 - Parameters as a list for `?`, or a map for `@name`.
 - Not yet: the `sha256_password` login, and the `timeZone` and `collation` options of the Dart driver.
+
+## URL options
+
+`MysqlNativePool.fromUrl()` takes the URL options that mysql_async took, so old URLs still work.
+
+These work like before: `pool_max`, `pool_min`, `stmt_cache_size`, `conn_ttl` (close a connection with no traffic for this many seconds), `wait_timeout` (the same, when `conn_ttl` is not set), `inactive_connection_ttl` (close idle connections over `pool_min`), `abs_conn_ttl` and `abs_conn_ttl_jitter` (close a connection after this age, once it has no query), `reset_connection` (on by default: reset the session when a connection has no query left), `tcp_keepalive` (milliseconds), `socket`, `require_ssl`, `verify_ca`, `verify_identity`, `built_in_roots`, `client_found_rows`, `tcp_nodelay` and `enable_cleartext_plugin`.
+`MysqlNativePool.open()` sets `reset_connection=false`, so the prepared statements stay.
+
+These are accepted and do nothing:
+
+- `compression`: the compressed protocol is not built. Queries work the same, only with more bytes on the network.
+- `prefer_socket`: mysql_async switched a local TCP connection to the Unix socket of the server. Use `socket` to pick the socket yourself.
+- `ttl_check_interval`: the ttl checks run at the exact time, so no interval is needed.
+- `max_allowed_packet`: only a check on the client side. The server still checks its own limit.
+- `secure_auth`: the old (pre 4.1) login is never used.
+
+An unknown option is an error.
 
 ## Documentation
 
