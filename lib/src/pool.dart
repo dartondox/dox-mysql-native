@@ -28,8 +28,9 @@ class MysqlNativeResult {
   );
 }
 
-/// A pool of MySQL or MariaDB connections, owned by Rust (mysql_async).
-/// Each connection keeps a cache of prepared statements.
+/// A pool of MySQL or MariaDB connections, owned by Rust. The Rust client
+/// runs on the thread of each isolate. Each connection keeps a cache of
+/// prepared statements.
 ///
 /// ```
 /// MysqlNativePool pool = MysqlNativePool.open(
@@ -71,8 +72,12 @@ class MysqlNativePool {
   /// [verifyCertificate] to false to skip the check, only for a self-signed
   /// certificate in development.
   ///
-  /// [threads] is the size of the Rust runtime of the whole process. Only
-  /// the first pool sets it. One thread is the fastest for most apps.
+  /// [maxConnections] is for the whole process: isolates that open the
+  /// same settings share it.
+  ///
+  /// [threads] is not used any more. The Rust client runs on the thread of
+  /// each isolate, so there is no runtime to size. It stays so old code
+  /// still compiles.
   factory MysqlNativePool.open({
     String host = 'localhost',
     int port = 3306,
@@ -116,8 +121,9 @@ class MysqlNativePool {
   }
 
   /// Makes a pool from a `mysql://user:password@host:port/database` URL.
-  /// It takes the URL options of mysql_async, like `?pool_max=20`, or
-  /// `?socket=/var/run/mysqld/mysqld.sock` for a Unix socket.
+  /// It takes the URL options of mysql_async (see the README), like
+  /// `?pool_max=20`, or `?socket=/var/run/mysqld/mysqld.sock` for a Unix
+  /// socket. [threads] is not used any more.
   factory MysqlNativePool.fromUrl(String url, {int threads = 1}) {
     if (!isAvailable) {
       throw UnsupportedError('dox_mysql_native is not available: $loadError');
@@ -253,11 +259,13 @@ class MysqlException implements Exception {
   }
 }
 
-/// One per isolate: the port Rust posts results to, and the requests
-/// that wait for them. Requests of one microtask go to Rust in one call.
+/// One per isolate: the link in Rust, and the requests that wait for their
+/// results. Requests of one microtask go to Rust in one call. Rust's idle
+/// helper posts `[1]` to the port when results come: then [_run] reads
+/// them. An empty message only checks that the isolate is alive.
 class _Link {
   _Link._() {
-    _port = RawReceivePort(_onBatch, 'dox_mysql_native');
+    _port = RawReceivePort(_onMessage, 'dox_mysql_native');
     _port.keepIsolateAlive = false;
     _handle = doxMysqlClient(_port.sendPort.nativePort);
     if (_handle <= 0) {
@@ -344,7 +352,10 @@ class _Link {
   void _flush() {
     _flushQueued = false;
     if (_len == 0) return;
-    doxMysqlSubmit(_handle, _out.address, _len);
+    // 1: some results are ready already (eg. the pool is closed)
+    if (doxMysqlSubmit(_handle, _out.address, _len) == 1) {
+      scheduleMicrotask(_run);
+    }
     _len = 0;
     if (_out.length > 1 << 20) {
       _out = Uint8List(1 << 14); // do not keep a big buffer forever
@@ -459,8 +470,30 @@ class _Link {
 
   // ---- results ----
 
-  void _onBatch(Object? message) {
-    Uint8List b = message as Uint8List;
+  /// the results, written by Rust
+  Uint8List _in = Uint8List(1 << 16);
+
+  void _onMessage(Object? message) {
+    if ((message as Uint8List).isNotEmpty) _run();
+  }
+
+  /// Reads the results that are there. Never waits.
+  void _run() {
+    int n = doxMysqlRun(_handle, _in.address, _in.length);
+    while (n < 0) {
+      int size = _in.length * 2;
+      while (size < -n) {
+        size *= 2;
+      }
+      _in = Uint8List(size);
+      n = doxMysqlRun(_handle, _in.address, _in.length);
+    }
+    // a view, no copy: _onBatch reads all it needs before it returns
+    if (n > 0) _onBatch(Uint8List.sublistView(_in, 0, n));
+    if (_in.length > 1 << 20) _in = Uint8List(1 << 16);
+  }
+
+  void _onBatch(Uint8List b) {
     ByteData d = ByteData.sublistView(b);
     int p = 0;
     while (p + 16 <= b.length) {
