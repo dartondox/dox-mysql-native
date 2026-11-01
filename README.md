@@ -22,7 +22,7 @@ To see what is ready and what may still change, read [Status and roadmap](https:
 ## How it works
 
 - A small MySQL client in Rust owns the connections. It runs on the thread of each isolate, so there is no extra thread in between.
-- The pool is for the whole process. Isolates that open the same settings share it, and `maxConnections` counts for all of them. A connection that one isolate does not use goes to an isolate that waits.
+- The pool is for the whole process. Isolates that open the same settings share it, and `maxConnections` counts for all of them. A connection that one isolate does not use goes to an isolate that waits, and busy isolates get a fair share each.
 - Many queries go down one connection at once (pipelining). The server answers them in order.
 - Your models and queries stay in Dart. You do not change any config.
 - Errors are `MysqlException`, with `message`, `code` and `sqlState`. For a server error, `code` is the MySQL error number (eg. 1062 for a duplicate key) and `sqlState` is the 5 character SQLSTATE. For other errors both are null.
