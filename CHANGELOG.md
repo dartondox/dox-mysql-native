@@ -1,6 +1,7 @@
 ## Unreleased
 
 - A pool that can not open now says why. The `ArgumentError` still starts with `dox_mysql_native: bad connection config`, then the reason (eg. a bad URL option, or a TLS setup that can not work).
+- New `sslRootCert` option of `MysqlNativePool.open()` (URL option `ssl_ca`): a PEM file with more CA certificates to trust, eg. a private CA. Before, only the Mozilla roots were trusted, so a private CA meant turning the check off. Without the option nothing changes.
 - The native ABI version is now 3.
 
 ## 3.0.1

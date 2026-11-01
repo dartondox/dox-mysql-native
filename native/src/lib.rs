@@ -128,11 +128,13 @@ fn post(port: i64, data: &[u8]) -> bool {
 // ---- options -----------------------------------------------------------
 
 /// TLS settings from the URL.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 struct TlsOpts {
     verify_ca: bool,
     verify_identity: bool,
     built_in_roots: bool,
+    /// a PEM file with more CA certificates to trust (`ssl_ca`)
+    ca: Option<String>,
 }
 
 /// What a `mysql://` URL says, with the defaults of mysql_async.
@@ -216,6 +218,7 @@ fn parse_url(text: &str) -> Option<Opts> {
         verify_ca: true,
         verify_identity: true,
         built_in_roots: true,
+        ca: None,
     };
     let mut require_ssl = false;
     for (k, v) in url.query_pairs() {
@@ -231,6 +234,7 @@ fn parse_url(text: &str) -> Option<Opts> {
             "verify_ca" => tls.verify_ca = flag()?,
             "verify_identity" => tls.verify_identity = flag()?,
             "built_in_roots" => tls.built_in_roots = flag()?,
+            "ssl_ca" => tls.ca = Some(v.into_owned()),
             "client_found_rows" => o.found_rows = flag()?,
             "tcp_nodelay" => o.nodelay = flag()?,
             "enable_cleartext_plugin" => o.cleartext = flag()?,
@@ -707,7 +711,7 @@ pub unsafe extern "C" fn dox_mysql_connect(
     let Some(opts) = parse_url(url) else {
         return fail(BAD_URL);
     };
-    let tls = match opts.tls {
+    let tls = match &opts.tls {
         Some(t) => match tls::config(t) {
             Ok(c) => Some(c),
             Err(e) => return fail(&e),
@@ -845,7 +849,10 @@ mod tests {
         assert_eq!((o.max, o.stmt_cache), (5, 8));
         assert_eq!(o.conn_ttl, Some(Duration::from_secs(60)));
         assert!(!o.reset);
-        assert!(!o.tls.unwrap().verify_ca && o.tls.unwrap().verify_identity);
+        let t = o.tls.unwrap();
+        assert!(!t.verify_ca && t.verify_identity && t.ca.is_none());
+        let o = parse_url("mysql://u@h/d?require_ssl=true&ssl_ca=/etc/ca%20b.pem").unwrap();
+        assert_eq!(o.tls.unwrap().ca.as_deref(), Some("/etc/ca b.pem"));
         let o = parse_url(
             "mysql://u@h/d?wait_timeout=7&abs_conn_ttl=9&tcp_keepalive=1500\
              &inactive_connection_ttl=3&compression=fast",

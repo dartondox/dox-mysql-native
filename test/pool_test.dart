@@ -283,6 +283,24 @@ void main() {
     );
   });
 
+  test('a missing sslRootCert file says why', () {
+    expect(
+      () => MysqlNativePool.open(
+        user: 'u',
+        database: 'd',
+        secure: true,
+        sslRootCert: '/no/such/ca.pem',
+      ),
+      throwsA(
+        isA<ArgumentError>().having(
+          (ArgumentError e) => '${e.message}',
+          'message',
+          contains('can not read ssl_ca /no/such/ca.pem'),
+        ),
+      ),
+    );
+  });
+
   test('bad params', () {
     expect(() => pool.query('SELECT 1', parameters: 1), throwsArgumentError);
   });
