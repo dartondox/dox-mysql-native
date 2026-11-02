@@ -30,6 +30,31 @@ MysqlNativePool open({
 }
 
 void main() {
+  test('a table rebuilt with another column type keeps text as text', () async {
+    // one connection, so the second insert finds the cached statement
+    MysqlNativePool pool = open(max: 1, cache: 27);
+    String insert = 'INSERT INTO mn_rebuilt (v) VALUES (?)';
+    String select = 'SELECT v FROM mn_rebuilt WHERE v = ?';
+    await pool.query('DROP TABLE IF EXISTS mn_rebuilt');
+    await pool.query('CREATE TABLE mn_rebuilt (v int)');
+    await pool.query(insert, parameters: <Object?>['7']);
+    expect(
+      (await pool.query(select, parameters: <Object?>['7'])).rows.single['v'],
+      7,
+    );
+    await pool.query('DROP TABLE mn_rebuilt');
+    await pool.query('CREATE TABLE mn_rebuilt (v varchar(10))');
+    await pool.query(insert, parameters: <Object?>['007']);
+    expect(
+      (await pool.query(select, parameters: <Object?>['007'])).rows,
+      <Map<String, dynamic>>[
+        <String, dynamic>{'v': '007'},
+      ],
+    );
+    await pool.query('DROP TABLE mn_rebuilt');
+    pool.close();
+  });
+
   test('2000 queries at once, errors mixed in, each answer to its own '
       'request', () async {
     MysqlNativePool pool = open(max: 3, cache: 5);

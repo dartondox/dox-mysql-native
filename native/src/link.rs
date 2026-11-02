@@ -60,6 +60,7 @@
 //! DNS: the host is looked up when the pool opens. After a failed connect
 //! a helper thread looks it up again. The isolate never waits for DNS.
 use std::collections::{HashMap, VecDeque};
+use std::fmt::Write as _;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -304,6 +305,17 @@ impl Cmd {
             Cmd::Close(_) => None,
         }
     }
+}
+
+/// The sql starts with CREATE, ALTER, DROP or RENAME: it may change the
+/// type of a column.
+// ponytail: a comment before the keyword hides it; such DDL keeps the
+// old statements.
+fn is_ddl(sql: &str) -> bool {
+    let s = sql.trim_start().as_bytes();
+    [&b"CREATE"[..], b"ALTER", b"DROP", b"RENAME"]
+        .iter()
+        .any(|w| s.get(..w.len()).is_some_and(|h| h.eq_ignore_ascii_case(w)))
 }
 
 /// A prepared statement of one connection.
@@ -590,6 +602,11 @@ impl Conn {
 
     /// A query: as text without params, as a prepared statement with.
     fn query(&mut self, w: Wait, sql: String, params: Vec<Param>, ready: &mut Vec<u8>) {
+        if is_ddl(&sql) {
+            // counted when it is sent: the commands after it on this
+            // connection run after it too
+            self.shared.schema.fetch_add(1, Ordering::Relaxed);
+        }
         if params.is_empty() {
             return self.put(Cmd::Query(w, sql), ready);
         }
@@ -598,9 +615,18 @@ impl Conn {
         // the types of the first EXECUTE of a statement: a later string
         // for a param first sent as a number is compared as a number
         // ('zzz' = 0). So each set of types gets its own statement.
-        let mut key = String::with_capacity(sql.len() + 1 + params.len());
+        // The key also has the `schema` count of the pool. MySQL 8.4
+        // keeps the param types of a statement when the table changes
+        // under it: '007' sent to a column that was int and is now text
+        // is stored as '7'. After a CREATE, ALTER, DROP or RENAME the key
+        // is new, so the statement is prepared again. The old ones leave
+        // the cache by the LRU.
+        let schema = self.shared.schema.load(Ordering::Relaxed);
+        let mut key = String::with_capacity(sql.len() + 24 + params.len());
         key.push_str(&sql);
         key.push('\0');
+        // ponytail: fmt of a u64 per prepared query, a few ns
+        let _ = write!(key, "{schema}\0");
         for p in &params {
             key.push(match p {
                 Param::Null => 'n',
@@ -2439,4 +2465,20 @@ pub unsafe extern "C" fn dox_mysql_run(link: i64, buf: *mut u8, cap: i64) -> i64
         s.arm();
     }
     n as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_ddl;
+
+    #[test]
+    fn schema_changes_are_seen() {
+        assert!(is_ddl("CREATE TABLE t (v int)"));
+        assert!(is_ddl("  alter table t add w int"));
+        assert!(is_ddl("\nDrop Table t"));
+        assert!(is_ddl("RENAME TABLE a TO b"));
+        assert!(!is_ddl("INSERT INTO t VALUES (1)"));
+        assert!(!is_ddl("SELECT 'CREATE'"));
+        assert!(!is_ddl("DRO"));
+    }
 }
