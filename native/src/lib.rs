@@ -291,6 +291,10 @@ struct Shared {
     /// the fair share of one link: max / active links, at least 1
     share: AtomicUsize,
     closed: AtomicBool,
+    /// goes up for each CREATE, ALTER, DROP or RENAME sent on this pool.
+    /// It is part of the statement cache key, so a statement prepared
+    /// before is not used again (see `Conn::query`).
+    schema: AtomicU64,
 }
 
 #[derive(Default)]
@@ -749,6 +753,7 @@ pub unsafe extern "C" fn dox_mysql_connect(
             hungry: AtomicUsize::new(0),
             share: AtomicUsize::new(opts_max),
             closed: AtomicBool::new(false),
+            schema: AtomicU64::new(0),
         }),
         refs: 1,
     });
