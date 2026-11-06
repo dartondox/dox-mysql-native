@@ -55,6 +55,23 @@ void main() {
     pool.close();
   });
 
+  test('a schema change after a comment is seen too', () async {
+    MysqlNativePool pool = open(max: 1, cache: 26);
+    String insert = 'INSERT INTO mn_commented (v) VALUES (?)';
+    await pool.query('DROP TABLE IF EXISTS mn_commented');
+    await pool.query('CREATE TABLE mn_commented (v int)');
+    await pool.query(insert, parameters: <Object?>['7']);
+    await pool.query('/* rebuild */ DROP TABLE mn_commented');
+    await pool.query('-- now text\nCREATE TABLE mn_commented (v varchar(10))');
+    await pool.query(insert, parameters: <Object?>['007']);
+    expect(
+      (await pool.query('SELECT v FROM mn_commented')).rows.single['v'],
+      '007',
+    );
+    await pool.query('DROP TABLE mn_commented');
+    pool.close();
+  });
+
   test('2000 queries at once, errors mixed in, each answer to its own '
       'request', () async {
     MysqlNativePool pool = open(max: 3, cache: 5);

@@ -265,6 +265,9 @@ struct Wait {
     out: Vec<u8>,
     count: u32,
     fail: Option<Fail>,
+    /// a CREATE, ALTER, DROP or RENAME: the pool counts a schema change
+    /// again when it is done
+    ddl: bool,
 }
 
 impl Wait {
@@ -283,6 +286,7 @@ impl Wait {
             out,
             count: 0,
             fail: None,
+            ddl: false,
         }
     }
 }
@@ -307,12 +311,25 @@ impl Cmd {
     }
 }
 
-/// The sql starts with CREATE, ALTER, DROP or RENAME: it may change the
-/// type of a column.
-// ponytail: a comment before the keyword hides it; such DDL keeps the
-// old statements.
+/// The sql starts with CREATE, ALTER, DROP or RENAME, after spaces and
+/// comments (`/* */`, `-- `, `#`): it may change the type of a column.
+// ponytail: an executable comment (`/*! CREATE ... */`) is skipped as a
+// comment, so DDL inside it keeps the old statements.
 fn is_ddl(sql: &str) -> bool {
-    let s = sql.trim_start().as_bytes();
+    let mut s = sql.as_bytes();
+    loop {
+        s = s.trim_ascii_start();
+        let rest = if let Some(r) = s.strip_prefix(b"/*") {
+            r.windows(2).position(|w| w == b"*/").map(|i| &r[i + 2..])
+        } else if s.starts_with(b"#") || s.starts_with(b"--") {
+            s.iter().position(|&c| c == b'\n').map(|i| &s[i + 1..])
+        } else {
+            break;
+        };
+        // a comment to the end: no keyword
+        let Some(r) = rest else { return false };
+        s = r;
+    }
     [&b"CREATE"[..], b"ALTER", b"DROP", b"RENAME"]
         .iter()
         .any(|w| s.get(..w.len()).is_some_and(|h| h.eq_ignore_ascii_case(w)))
@@ -601,11 +618,14 @@ impl Conn {
     }
 
     /// A query: as text without params, as a prepared statement with.
-    fn query(&mut self, w: Wait, sql: String, params: Vec<Param>, ready: &mut Vec<u8>) {
+    fn query(&mut self, mut w: Wait, sql: String, params: Vec<Param>, ready: &mut Vec<u8>) {
         if is_ddl(&sql) {
             // counted when it is sent: the commands after it on this
-            // connection run after it too
+            // connection run after it too. Counted again when it is done
+            // (`done`): another connection may prepare a statement while
+            // the DDL runs, and that one has the old types.
             self.shared.schema.fetch_add(1, Ordering::Relaxed);
+            w.ddl = true;
         }
         if params.is_empty() {
             return self.put(Cmd::Query(w, sql), ready);
@@ -621,6 +641,10 @@ impl Conn {
         // is stored as '7'. After a CREATE, ALTER, DROP or RENAME the key
         // is new, so the statement is prepared again. The old ones leave
         // the cache by the LRU.
+        // ponytail: a schema change from another process is not seen.
+        // MySQL gives no error for it (it prepares the statement again by
+        // itself, with the old param types), so there is nothing to catch
+        // and retry.
         let schema = self.shared.schema.load(Ordering::Relaxed);
         let mut key = String::with_capacity(sql.len() + 24 + params.len());
         key.push_str(&sql);
@@ -1088,6 +1112,9 @@ impl Conn {
 
     /// A command is answered: its record goes to Dart.
     fn done(&mut self, mut w: Wait, ready: &mut Vec<u8>, now: Instant) {
+        if w.ddl {
+            self.shared.schema.fetch_add(1, Ordering::Relaxed);
+        }
         match w.what {
             What::Result { .. } => {
                 if self.tx.is_some() {
@@ -2480,5 +2507,10 @@ mod tests {
         assert!(!is_ddl("INSERT INTO t VALUES (1)"));
         assert!(!is_ddl("SELECT 'CREATE'"));
         assert!(!is_ddl("DRO"));
+        assert!(is_ddl("/* migration 7 */ ALTER TABLE t ADD w int"));
+        assert!(is_ddl("-- add w\n# and more\n  /* x */\tdrop table t"));
+        assert!(!is_ddl("/* CREATE */ SELECT 1"));
+        assert!(!is_ddl("-- CREATE TABLE t"));
+        assert!(!is_ddl("/* not closed CREATE"));
     }
 }
