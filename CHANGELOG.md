@@ -1,3 +1,7 @@
+## Unreleased
+
+- Fix: the build hook now tries the download of the native library up to 3 times (waits 1 s, then 3 s). Before, one bad answer from GitHub (eg. 503 or 504) meant no native library, and the app stopped at start. It tries again on a 5xx or 429 status, a connection error or timeout, and a wrong sha256. A 404 is not tried again. If all 3 tries fail, nothing changes: the hook falls back to cargo or adds no library.
+
 ## 3.0.2
 
 - Fix: on MySQL 8.4 a text param could be stored with the wrong type after a table was changed. Example: a column was `int`, the table was dropped and made again with a `varchar` column, then `'007'` was inserted with the same SQL. It was stored as `'7'`. MySQL keeps the param types of a prepared statement when the table changes under it. Now a `CREATE`, `ALTER`, `DROP` or `RENAME` sent on the pool makes every connection prepare its statements again. Normal queries do no extra round trip. Comments and spaces before the keyword (`/* */`, `-- `, `#`) are skipped, so a commented migration counts too. The change is counted again when the server says it is done, so a statement that another connection prepared while the change ran is prepared again too. A schema change from another process is not seen: MySQL gives no error for it, so there is nothing to catch. MariaDB was not affected.
