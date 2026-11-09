@@ -439,17 +439,26 @@ impl Shared {
     }
 }
 
+/// A connect error that says the host and port, so a wrong one is easy to
+/// see. Never the password.
+fn dial_fail(o: &crate::Opts, e: impl std::fmt::Display) -> Fail {
+    io_fail(format!(
+        "can not connect to host {}, port {}: {e}",
+        o.host, o.port
+    ))
+}
+
 /// Opens a socket to the next address. The connect goes on in the loop.
-fn connect_next(addrs: &mut Vec<SocketAddr>) -> Result<Sock, Fail> {
+fn connect_next(o: &crate::Opts, addrs: &mut Vec<SocketAddr>) -> Result<Sock, Fail> {
     let mut last = None;
     while !addrs.is_empty() {
         let a = addrs.remove(0);
         match TcpStream::connect(a) {
             Ok(s) => return Ok(Sock::Tcp(s)),
-            Err(e) => last = Some(format!("can not connect to {a}: {e}")),
+            Err(e) => last = Some(format!("{e} ({a})")),
         }
     }
-    Err(io_fail(last.unwrap_or_else(|| "no address".into())))
+    Err(dial_fail(o, last.unwrap_or_else(|| "no address".into())))
 }
 
 impl Conn {
@@ -474,7 +483,7 @@ impl Conn {
                 shared.resolve_later();
                 return Err(io_fail(format!("can not find the host {}", o.host)));
             }
-            let s = connect_next(&mut addrs).inspect_err(|_| shared.resolve_later())?;
+            let s = connect_next(o, &mut addrs).inspect_err(|_| shared.resolve_later())?;
             (s, Phase::Connect(addrs))
         };
         let max_age = max_age(o);
@@ -2107,13 +2116,13 @@ impl Core {
                     return;
                 }
                 Err(e) => {
-                    let why = io_fail(format!("can not connect: {e}"));
+                    let why = dial_fail(&c.shared.opts, e);
                     if addrs.is_empty() {
                         c.shared.resolve_later();
                         return self.close(k, Some(why));
                     }
                     let _ = registry.deregister(c.sock.source());
-                    match connect_next(addrs) {
+                    match connect_next(&c.shared.opts, addrs) {
                         Ok(s) => {
                             c.sock = s;
                             let i = Interest::READABLE | Interest::WRITABLE;
@@ -2496,7 +2505,21 @@ pub unsafe extern "C" fn dox_mysql_run(link: i64, buf: *mut u8, cap: i64) -> i64
 
 #[cfg(test)]
 mod tests {
-    use super::is_ddl;
+    use super::{dial_fail, is_ddl};
+    use crate::{Fail, parse_url};
+
+    #[test]
+    fn connect_error_names_host_and_port() {
+        let o = parse_url("mysql://u:secret@db.local:3307/d").unwrap();
+        let Fail::Client(text) = dial_fail(&o, "Connection refused") else {
+            panic!("not a client error");
+        };
+        assert_eq!(
+            text,
+            "dox_mysql_native: can not connect to host db.local, port 3307: Connection refused"
+        );
+        assert!(!text.contains("secret"));
+    }
 
     #[test]
     fn schema_changes_are_seen() {
