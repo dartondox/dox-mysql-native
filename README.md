@@ -67,6 +67,21 @@ void main() async {
 - For all connections: set the env var `DOX_DB_DRIVER=dart`.
 - For one connection: `extra: <String, dynamic>{'native': false}` in its `ConnectionConfig`.
 
+## Skip the download
+
+By default the build hook gets the native library for this package. If your app does not use this database, you can turn that off.
+In your app `pubspec.yaml`:
+
+```yaml
+hooks:
+  user_defines:
+    dox_mysql_native:
+      skip: true
+```
+
+Then no library is downloaded or built. Only a real `true` counts.
+If the app still opens a pool, it throws an error that says the library is not in the build.
+
 ## Features
 
 - Many queries go to Rust in one call. Many results come back in one message.
