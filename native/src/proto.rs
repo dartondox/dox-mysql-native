@@ -318,10 +318,10 @@ pub(crate) fn rsa_password(pem: &[u8], pw: &[u8], nonce: &[u8]) -> Result<Vec<u8
     use rsa::pkcs8::DecodePublicKey;
     let bad = |e: String| Fail::Client(format!("dox_mysql_native: RSA key of the server: {e}"));
     let pem = std::str::from_utf8(pem).map_err(|e| bad(e.to_string()))?;
-    let key = rsa::RsaPublicKey::from_public_key_pem(pem.trim_end_matches('\0'))
+    let key = rsa::PublicKey::from_public_key_pem(pem.trim_end_matches('\0'))
         .or_else(|_| {
             use rsa::pkcs1::DecodeRsaPublicKey;
-            rsa::RsaPublicKey::from_pkcs1_pem(pem.trim_end_matches('\0'))
+            rsa::PublicKey::from_pkcs1_pem(pem.trim_end_matches('\0'))
         })
         .map_err(|e| bad(e.to_string()))?;
     let nonce = &nonce[..nonce.len().min(20)];
@@ -330,12 +330,8 @@ pub(crate) fn rsa_password(pem: &[u8], pw: &[u8], nonce: &[u8]) -> Result<Vec<u8
     for (i, b) in data.iter_mut().enumerate() {
         *b ^= nonce[i % nonce.len()];
     }
-    key.encrypt(
-        &mut rsa::rand_core::OsRng,
-        rsa::Oaep::new::<sha1::Sha1>(),
-        &data,
-    )
-    .map_err(|e| bad(e.to_string()))
+    key.oaep_encrypt::<sha1::Sha1>(&data)
+        .map_err(|e| bad(e.to_string()))
 }
 
 /// The SSL request: the start of the login packet, before TLS.
@@ -620,6 +616,29 @@ pub(crate) fn execute(out: &mut Vec<u8>, id: u32, params: &[Param]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rsa_password_is_oaep_sha1() {
+        use rsa::Generate;
+        use rsa::pkcs1::EncodeRsaPublicKey;
+        use rsa::pkcs8::{EncodePublicKey, LineEnding};
+        let private = rsa::PrivateKey::generate();
+        let public = private.to_public_key();
+        let spki = public.to_public_key_pem(LineEnding::LF).unwrap();
+        let pkcs1 = public.to_pkcs1_pem(LineEnding::LF).unwrap();
+        let nonce: Vec<u8> = (1..=20).collect();
+        let mut want = b"secret".to_vec();
+        want.push(0);
+        for (i, b) in want.iter_mut().enumerate() {
+            *b ^= nonce[i];
+        }
+        // the server sends the PEM with a 0 byte at the end
+        for pem in [format!("{spki}\0"), pkcs1] {
+            let enc = rsa_password(pem.as_bytes(), b"secret", &nonce).unwrap();
+            assert_eq!(private.oaep_decrypt::<sha1::Sha1>(&enc).unwrap(), want);
+        }
+        assert!(rsa_password(b"not a key", b"secret", &nonce).is_err());
+    }
 
     #[test]
     fn packets_split_and_join() {

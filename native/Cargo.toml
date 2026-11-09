@@ -11,8 +11,8 @@ crate-type = ["cdylib"]
 mio = { version = "1.2.4", features = ["os-poll", "net"] }
 percent-encoding = "2.3.2"
 # caching_sha2_password without TLS: the password goes RSA encrypted.
-# rsa 0.9 is the newest stable, and its OAEP needs sha1 0.10.
-rsa = { version = "0.9.10", features = ["getrandom"] }
+# rsa and sha1 must use the same digest version (0.11).
+rsa = "0.10.0"
 sha1 = "0.11.0"
 # rustls + ring for TLS (ring also gives the SHA hashes of the login)
 ring = "0.17.14"
