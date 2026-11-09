@@ -369,8 +369,8 @@ class _Link {
       // the build hook found no library for this platform
       _loadError =
           'the native library is not in the build ($error). If `skip: true` '
-          'is set for dox_mysql_native under `hooks: user_defines:` in pubspec.yaml, '
-          'remove it.';
+          'is set for dox_mysql_native under `hooks: user_defines:` in the '
+          "app's root pubspec.yaml, remove it.";
       return false;
     }
   }
