@@ -311,28 +311,73 @@ impl Cmd {
     }
 }
 
-/// The sql starts with CREATE, ALTER, DROP or RENAME, after spaces and
-/// comments (`/* */`, `-- `, `#`): it may change the type of a column.
+/// A statement of the sql starts with CREATE, ALTER, DROP or RENAME,
+/// after spaces and comments (`/* */`, `-- `, `#`): it may change the type
+/// of a column. Each statement of a multi-statement query counts, eg.
+/// `SELECT 1; ALTER TABLE t ...`. A `;` inside a string or a comment does
+/// not start a statement.
 // ponytail: an executable comment (`/*! CREATE ... */`) is skipped as a
 // comment, so DDL inside it keeps the old statements.
 fn is_ddl(sql: &str) -> bool {
-    let mut s = sql.as_bytes();
-    loop {
-        s = s.trim_ascii_start();
-        let rest = if let Some(r) = s.strip_prefix(b"/*") {
-            r.windows(2).position(|w| w == b"*/").map(|i| &r[i + 2..])
-        } else if s.starts_with(b"#") || s.starts_with(b"--") {
-            s.iter().position(|&c| c == b'\n').map(|i| &s[i + 1..])
-        } else {
-            break;
-        };
-        // a comment to the end: no keyword
-        let Some(r) = rest else { return false };
-        s = r;
+    let s = sql.as_bytes();
+    let mut i = 0;
+    // at the start of a statement
+    let mut start = true;
+    while i < s.len() {
+        let c = s[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        let rest = &s[i..];
+        if rest.starts_with(b"/*") {
+            // not closed: a comment to the end
+            let Some(p) = rest[2..].windows(2).position(|w| w == b"*/") else {
+                return false;
+            };
+            i += p + 4;
+            continue;
+        }
+        // MySQL needs a space or a control char after `--`
+        let dashes = rest.starts_with(b"--")
+            && rest
+                .get(2)
+                .is_none_or(|&b| b.is_ascii_whitespace() || b.is_ascii_control());
+        if c == b'#' || dashes {
+            let Some(p) = rest.iter().position(|&b| b == b'\n') else {
+                return false;
+            };
+            i += p + 1;
+            continue;
+        }
+        if start
+            && [&b"CREATE"[..], b"ALTER", b"DROP", b"RENAME"]
+                .iter()
+                .any(|w| {
+                    rest.get(..w.len())
+                        .is_some_and(|h| h.eq_ignore_ascii_case(w))
+                })
+        {
+            return true;
+        }
+        start = c == b';';
+        if matches!(c, b'\'' | b'"' | b'`') {
+            // skip the string or quoted name; a backslash escapes in
+            // strings, and a doubled quote is two strings in a row
+            let mut j = i + 1;
+            loop {
+                match s.get(j) {
+                    None => return false,
+                    Some(&b'\\') if c != b'`' => j += 2,
+                    Some(&b) if b == c => break,
+                    Some(_) => j += 1,
+                }
+            }
+            i = j;
+        }
+        i += 1;
     }
-    [&b"CREATE"[..], b"ALTER", b"DROP", b"RENAME"]
-        .iter()
-        .any(|w| s.get(..w.len()).is_some_and(|h| h.eq_ignore_ascii_case(w)))
+    false
 }
 
 /// A prepared statement of one connection.
@@ -1831,6 +1876,13 @@ impl Core {
         if let Some(tx) = c.tx {
             end_tx(tx);
         }
+        // a DDL that got no answer (it timed out, or the connection
+        // dropped): count the schema change again, as `done` does. Else a
+        // statement that another connection prepared while it ran keeps
+        // the old types.
+        if c.waits.iter().any(|w| w.ddl) {
+            c.shared.schema.fetch_add(1, Ordering::Relaxed);
+        }
         if let Some(f) = why {
             c.fail_all(&f, &mut self.ready);
         }
@@ -2535,5 +2587,18 @@ mod tests {
         assert!(!is_ddl("/* CREATE */ SELECT 1"));
         assert!(!is_ddl("-- CREATE TABLE t"));
         assert!(!is_ddl("/* not closed CREATE"));
+        // `--` with no space after it is not a comment
+        assert!(!is_ddl("--x\nCREATE TABLE t"));
+        assert!(!is_ddl("--\tCREATE TABLE t"));
+        assert!(is_ddl("--\nCREATE TABLE t"));
+        // each statement of a multi-statement query
+        assert!(is_ddl("SELECT 1; ALTER TABLE t ADD w int"));
+        assert!(is_ddl("SELECT 1;/* x */ -- y\n drop table t"));
+        assert!(!is_ddl("SELECT ';ALTER'"));
+        assert!(!is_ddl("SELECT 'it\\';ALTER'"));
+        assert!(!is_ddl("SELECT `a;ALTER`"));
+        assert!(!is_ddl("SELECT \"x\"\"; DROP\""));
+        assert!(!is_ddl("SELECT 1 /* ; ALTER */"));
+        assert!(!is_ddl("SELECT 'not closed; ALTER"));
     }
 }
