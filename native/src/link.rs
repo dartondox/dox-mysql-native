@@ -318,7 +318,19 @@ impl Cmd {
 /// not start a statement.
 // ponytail: an executable comment (`/*! CREATE ... */`) is skipped as a
 // comment, so DDL inside it keeps the old statements.
+//
+// The driver does not know if the sql_mode has NO_BACKSLASH_ESCAPES (it can
+// change in the middle of a pipeline, eg. with SET). With it, a backslash
+// is a plain char, so `'a\'` is a whole string. So sql with a backslash is
+// read both ways, and DDL in either way counts. A wrong count only makes
+// the connections prepare their statements again, which is safe. A missed
+// one can keep old param types.
 fn is_ddl(sql: &str) -> bool {
+    scan_ddl(sql, true) || (sql.contains('\\') && scan_ddl(sql, false))
+}
+
+/// [is_ddl] for one sql_mode: `escapes` is false with NO_BACKSLASH_ESCAPES.
+fn scan_ddl(sql: &str, escapes: bool) -> bool {
     let s = sql.as_bytes();
     let mut i = 0;
     // at the start of a statement
@@ -368,7 +380,7 @@ fn is_ddl(sql: &str) -> bool {
             loop {
                 match s.get(j) {
                     None => return false,
-                    Some(&b'\\') if c != b'`' => j += 2,
+                    Some(&b'\\') if escapes && c != b'`' => j += 2,
                     Some(&b) if b == c => break,
                     Some(_) => j += 1,
                 }
@@ -2595,7 +2607,17 @@ mod tests {
         assert!(is_ddl("SELECT 1; ALTER TABLE t ADD w int"));
         assert!(is_ddl("SELECT 1;/* x */ -- y\n drop table t"));
         assert!(!is_ddl("SELECT ';ALTER'"));
-        assert!(!is_ddl("SELECT 'it\\';ALTER'"));
+        // NO_BACKSLASH_ESCAPES: `'a\'` is a whole string, so the ALTER after
+        // it is a statement. Read both ways, so this counts too.
+        assert!(is_ddl("SELECT 'a\\'; ALTER TABLE t ADD w int"));
+        assert!(is_ddl("SELECT \"a\\\"; DROP TABLE t"));
+        // the other way round: one string with backslash escapes. It also
+        // counts (one extra prepare, which is safe).
+        assert!(is_ddl("SELECT 'it\\';ALTER'"));
+        // a backslash with no DDL in either reading
+        assert!(!is_ddl("SELECT 'it\\'s', 'a\\\\'"));
+        assert!(!is_ddl("SELECT 'a\\'"));
+        assert!(!is_ddl("SELECT `a\\`; SELECT 1"));
         assert!(!is_ddl("SELECT `a;ALTER`"));
         assert!(!is_ddl("SELECT \"x\"\"; DROP\""));
         assert!(!is_ddl("SELECT 1 /* ; ALTER */"));

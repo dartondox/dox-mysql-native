@@ -2,6 +2,7 @@
 
 - Fix: `--` with no space after it is not a comment in MySQL, and is no longer read as one when a schema change is looked for.
 - Fix: a schema change in a multi-statement query (eg. `SELECT 1; ALTER TABLE t ...`) is now seen, so the statements are prepared again.
+- Fix: with the sql_mode `NO_BACKSLASH_ESCAPES`, a backslash is a plain char, so `'a\'` is a whole string. The schema change check read it as an escape, so it could miss a `CREATE`, `ALTER`, `DROP` or `RENAME` after such a string. Now sql with a backslash is read both ways, and a schema change in either way counts. In rare cases this counts a change that is not one. Then the statements are only prepared again, which is safe.
 - Fix: a `CREATE`, `ALTER`, `DROP` or `RENAME` that times out, or whose connection drops, now counts as a schema change when it ends too. Before, a statement that another connection prepared while it ran could keep the old param types.
 - A failed connect now says the host and port, eg. `can not connect to host db.local, port 3306: Connection refused`. Before, it often said only `can not connect: Connection refused (os error 61)`, so a wrong host or port was hard to see. The password is never in the message.
 - Fix: each download try of the native library now has one time limit of 60 s, from connect to the last byte. Before, there was no limit while waiting for the answer, and the 60 s limit for the body only counted the gap between two chunks. So a slow server could hang the build for a long time. Now 3 tries take about 3 minutes at most.
