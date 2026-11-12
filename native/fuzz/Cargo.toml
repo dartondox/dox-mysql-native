@@ -1,0 +1,76 @@
+[package]
+name = "dox_mysql_native-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# The library source of native/ is built here as an rlib. native/ itself
+# stays a cdylib only, so fuzzing does not change the shipped library.
+# Keep these dependencies the same as in native/Cargo.toml.
+[lib]
+name = "dox_mysql_native"
+path = "../src/lib.rs"
+test = false
+doc = false
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+mio = { version = "1.2.4", features = ["os-poll", "net"] }
+percent-encoding = "2.3.2"
+rsa = "0.10.0"
+sha1 = "0.11.0"
+ring = "0.17.14"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+slab = "0.4.12"
+socket2 = "0.6.5"
+url = "2.5.8"
+webpki-roots = "1.0.11"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"
+
+# the source of native/ has `#[cfg(fuzzing)]`, which cargo fuzz sets
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
+# its own workspace, so it is not part of the main build
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "packets"
+path = "fuzz_targets/packets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rows"
+path = "fuzz_targets/rows.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake"
+path = "fuzz_targets/handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "conn"
+path = "fuzz_targets/conn.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false
+bench = false

@@ -609,8 +609,13 @@ impl Conn {
             let s = connect_next(o, &mut addrs).inspect_err(|_| shared.resolve_later())?;
             (s, Phase::Connect(addrs))
         };
-        let max_age = max_age(o);
-        Ok(Conn {
+        Ok(Conn::new(shared, sock, phase, now))
+    }
+
+    /// A connection over a socket, in this phase.
+    fn new(shared: Arc<Shared>, sock: Sock, phase: Phase, now: Instant) -> Conn {
+        let max_age = max_age(&shared.opts);
+        Conn {
             sock,
             tls: None,
             shared,
@@ -641,7 +646,7 @@ impl Conn {
             doomed: false,
             kill: None,
             hold: None,
-        })
+        }
     }
 
     fn ready(&self) -> bool {
@@ -979,9 +984,15 @@ impl Conn {
         let inb = std::mem::take(&mut self.inb);
         let mut p = self.in_s;
         let mut res = Ok(());
-        while !self.paused()
-            && let Some((payload, seq, used)) = proto::next_packet(&inb[p..self.in_e])
-        {
+        while !self.paused() {
+            let (payload, seq, used) = match proto::next_packet(&inb[p..self.in_e]) {
+                Ok(Some(next)) => next,
+                Ok(None) => break,
+                Err(e) => {
+                    res = Err(e);
+                    break;
+                }
+            };
             p += used;
             self.seq = seq;
             res = if self.ready() {
@@ -1213,6 +1224,10 @@ impl Conn {
             St::Cols(left) => {
                 if w.first {
                     let mut c = proto::column(b).ok_or_else(bad)?;
+                    // the record has the length of a name in 2 bytes
+                    if c.name.len() > usize::from(u16::MAX) {
+                        return Err(bad());
+                    }
                     if c.kind == crate::Kind::LongText && !maria {
                         c.kind = crate::Kind::Text;
                     }
@@ -2949,10 +2964,432 @@ pub unsafe extern "C" fn dox_mysql_run(link: i64, buf: *mut u8, cap: i64) -> i64
     n as i64
 }
 
+/// A connection over a socketpair and a pool with no network, to run the
+/// read side of a connection on bytes: for the unit tests and `fuzz`.
+#[cfg(all(unix, any(test, fuzzing)))]
+mod harness {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    pub(super) fn shared(cleartext: bool) -> Arc<Shared> {
+        let url = if cleartext {
+            "mysql://u:pw@127.0.0.1:3306/db?enable_cleartext_plugin=true"
+        } else {
+            "mysql://u:pw@127.0.0.1:3306/db"
+        };
+        Arc::new(Shared {
+            id: 0,
+            url: url.into(),
+            opts: crate::parse_url(url).unwrap(),
+            tls: None,
+            addrs: Mutex::new(Vec::new()),
+            resolving: AtomicBool::new(false),
+            state: Mutex::new(Default::default()),
+            waiting: AtomicUsize::new(0),
+            hungry: AtomicUsize::new(0),
+            share: AtomicUsize::new(1),
+            closed: AtomicBool::new(false),
+            schema: AtomicU64::new(0),
+        })
+    }
+
+    thread_local! {
+        /// one connected TCP socket for the whole run: a conn gets a copy
+        static TCP: std::net::TcpStream = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let s = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+            // the listener lives on: its backlog holds the connection
+            std::mem::forget(l);
+            s
+        };
+    }
+
+    /// tcp: a TCP socket (the password never goes in clear), else a Unix
+    /// socket. The conn never reads or writes it.
+    pub(super) fn new_conn(tcp: bool, cleartext: bool, ready: bool) -> Conn {
+        let sock = if tcp {
+            Sock::Tcp(TcpStream::from_std(TCP.with(|s| s.try_clone()).unwrap()))
+        } else {
+            let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+            Sock::Unix(mio::net::UnixStream::from_std(a))
+        };
+        let phase = if ready { Phase::Ready } else { Phase::Greeting };
+        Conn::new(shared(cleartext), sock, phase, Instant::now())
+    }
+
+    /// What `fill` and `process` do with bytes that came in. Err: the
+    /// connection is broken, the commands fail like `Core::close` does.
+    pub(super) fn feed(c: &mut Conn, ready: &mut Vec<u8>, bytes: &[u8]) -> Result<(), Fail> {
+        room(&mut c.inb, &mut c.in_s, &mut c.in_e, bytes.len());
+        c.inb[c.in_e..c.in_e + bytes.len()].copy_from_slice(bytes);
+        c.in_e += bytes.len();
+        let mut r = c.process(ready, Instant::now());
+        // Dart takes the chunks of a stream: more credit, like an OP_MORE
+        // request does, and read on
+        while r.is_ok() && c.paused() {
+            c.waits[0].credit += 1;
+            r = c.process(ready, Instant::now());
+        }
+        if let Err(f) = &r {
+            c.fail_all(f, ready);
+        }
+        r
+    }
+
+    pub(super) fn text(f: &Fail) -> String {
+        match f {
+            Fail::Server {
+                code,
+                state,
+                message,
+            } => format!("server {code} {state:?} {message}"),
+            Fail::Client(m) => format!("client {m}"),
+            Fail::Cancelled => "cancelled".into(),
+        }
+    }
+
+    pub(super) fn wait(id: u64, what: What) -> Wait {
+        Wait::new(id, what, Instant::now() + Duration::from_secs(300))
+    }
+
+    /// The records in `ready` read like `_onBatch` and `_rows` of
+    /// lib/src/pool.dart do. Err: a record Dart could not read, or would
+    /// read past its end. Ok: (id, status) of each record.
+    pub(super) fn records(ready: &[u8]) -> Result<Vec<(u64, u8)>, String> {
+        fn u16_at(b: &[u8], p: usize) -> Result<usize, String> {
+            let s = b.get(p..p + 2).ok_or("read past the end")?;
+            Ok(usize::from(u16::from_le_bytes([s[0], s[1]])))
+        }
+        fn u32_at(b: &[u8], p: usize) -> Result<usize, String> {
+            let s = b.get(p..p + 4).ok_or("read past the end")?;
+            Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as usize)
+        }
+        let (mut p, mut seen) = (0, Vec::new());
+        while p < ready.len() {
+            let head = ready.get(p..p + 16).ok_or("a cut record head")?;
+            let id = u64::from_le_bytes(head[..8].try_into().unwrap());
+            let status = head[8];
+            if status > 2 || head[9..12] != [0, 0, 0] {
+                return Err(format!("bad status or reserved bytes in record of {id}"));
+            }
+            let len = u32_at(head, 12)?;
+            let body = ready
+                .get(p + 16..p + 16 + len)
+                .ok_or("the body is longer than the record")?;
+            p += 16 + len;
+            seen.push((id, status));
+            if status == 1 {
+                // u16 code, u8 kind, 5 bytes sqlstate, message
+                if body.len() < 8 || body[2] > 2 {
+                    return Err(format!("bad error record of {id}"));
+                }
+                continue;
+            }
+            if body.len() < 24 {
+                return Err(format!("short ok record of {id}"));
+            }
+            let (ncols, nrows) = (u32_at(body, 16)?, u32_at(body, 20)?);
+            let mut q = 24;
+            for _ in 0..ncols {
+                q += 2 + u16_at(body, q)?;
+                if q > body.len() {
+                    return Err(format!("a name goes past the end in record of {id}"));
+                }
+            }
+            // the cells, until the body ends: rows * columns of them
+            for _ in 0..if ncols == 0 { 0 } else { nrows } {
+                for _ in 0..ncols {
+                    let tag = *body.get(q).ok_or("a cell is missing")?;
+                    q += 1;
+                    q += match tag {
+                        0 => 0,
+                        1 | 2 | 5 => 8,
+                        6 => 1,
+                        3 | 4 | 7 | 8 => 4 + u32_at(body, q)?,
+                        _ => return Err(format!("unknown cell tag {tag} in record of {id}")),
+                    };
+                    if q > body.len() {
+                        return Err(format!("a cell goes past the end in record of {id}"));
+                    }
+                }
+            }
+            if q != body.len() {
+                return Err(format!(
+                    "record of {id}: the cells end at {q}, the body at {}",
+                    body.len()
+                ));
+            }
+        }
+        Ok(seen)
+    }
+}
+
+/// Entry point for the fuzz target `conn` in `fuzz/`. Only in `cargo fuzz`
+/// builds (`--cfg fuzzing`), not in the library.
+#[cfg(all(unix, fuzzing))]
+#[doc(hidden)]
+pub mod fuzz {
+    use super::harness::*;
+    use super::*;
+
+    /// What a run leaves behind, to compare two runs.
+    #[derive(PartialEq, Debug)]
+    struct Outcome {
+        ready: Vec<u8>,
+        err: Option<String>,
+        out: usize,
+        phase: std::mem::Discriminant<Phase>,
+        waits: usize,
+    }
+
+    /// Sends the commands in `cmds` (one byte each) to a ready connection.
+    /// Gives the ids that must get a record.
+    fn script(c: &mut Conn, cmds: &[u8], ready: &mut Vec<u8>) -> Vec<(u64, bool)> {
+        let mut ids = Vec::new();
+        for (i, d) in cmds.iter().enumerate() {
+            let id = i as u64 + 1;
+            let rows = |binary| What::Result { rows: true, binary };
+            match d & 7 {
+                0 => c.put(Cmd::Query(wait(id, rows(false)), "SELECT 1".into()), ready),
+                1 => {
+                    let what = What::Result {
+                        rows: false,
+                        binary: false,
+                    };
+                    c.put(
+                        Cmd::Query(wait(id, what), "UPDATE t SET a = 1".into()),
+                        ready,
+                    )
+                }
+                2 => {
+                    let mut w = wait(id, rows(false));
+                    w.chunk = 1 + u32::from(d >> 3 & 3);
+                    w.credit = CREDIT;
+                    c.put(Cmd::Query(w, "SELECT 2".into()), ready)
+                }
+                3 => c.query(
+                    wait(id, rows(true)),
+                    "SELECT ?".into(),
+                    vec![Param::Int(1)],
+                    ready,
+                ),
+                4 => {
+                    c.tx = Some(id);
+                    c.put(
+                        Cmd::Query(wait(id, What::Begin(id)), "START TRANSACTION".into()),
+                        ready,
+                    )
+                }
+                5 => {
+                    c.ending = true;
+                    c.put(Cmd::Query(wait(id, What::End), "COMMIT".into()), ready)
+                }
+                6 => {
+                    c.put(Cmd::Query(wait(0, What::Silent), "ROLLBACK".into()), ready);
+                    continue;
+                }
+                _ => {
+                    c.put(Cmd::Reset(Instant::now() + Duration::from_secs(300)), ready);
+                    continue;
+                }
+            }
+            ids.push((id, d & 7 == 2));
+        }
+        ids
+    }
+
+    /// Runs the server bytes `wire`, all at once or in random pieces.
+    fn run(flags: u8, seed: u8, cmds: &[u8], wire: &[u8], pieces: bool) -> Outcome {
+        let ready_mode = flags & 4 != 0;
+        let mut c = new_conn(flags & 1 != 0, flags & 2 != 0, ready_mode);
+        c.maria = flags & 8 != 0;
+        let mut ready = Vec::new();
+        let ids = if ready_mode {
+            script(&mut c, cmds, &mut ready)
+        } else {
+            // a login, then one query that waits for it
+            c.put(
+                Cmd::Query(
+                    wait(
+                        1,
+                        What::Result {
+                            rows: true,
+                            binary: false,
+                        },
+                    ),
+                    "SELECT 1".into(),
+                ),
+                &mut ready,
+            );
+            vec![(1, false)]
+        };
+        let mut err = None;
+        if pieces {
+            let (mut at, mut rng) = (0, u32::from(seed) | 1);
+            while at < wire.len() && err.is_none() {
+                rng ^= rng << 13;
+                rng ^= rng >> 17;
+                rng ^= rng << 5;
+                let end = (at + 1 + rng as usize % 700).min(wire.len());
+                err = feed(&mut c, &mut ready, &wire[at..end]).err();
+                at = end;
+            }
+        } else {
+            err = feed(&mut c, &mut ready, wire).err();
+        }
+        // the server closes the socket: the commands that wait fail
+        if flags & 16 != 0 && err.is_none() {
+            let f = Fail::client("dox_mysql_native: the server closed the connection");
+            c.fail_all(&f, &mut ready);
+            err = Some(f);
+        }
+        // no memory growth: the answer is not much bigger than the input
+        // (a binary row of NULL columns is 1 byte for each column and 1 bit
+        // in the row), and the bytes to send are small
+        assert!(
+            ready.len() + c.out.len() <= 40 * wire.len() + 16 * 1024,
+            "{} bytes in, {} bytes out",
+            wire.len(),
+            ready.len() + c.out.len()
+        );
+        // each record can be read, and each command is answered once
+        let seen = match records(&ready) {
+            Ok(s) => s,
+            Err(e) => panic!("bad record: {e}"),
+        };
+        for &(id, stream) in &ids {
+            let done = seen.iter().filter(|r| r.0 == id && r.1 != 2).count();
+            assert!(done <= 1, "command {id} got {done} answers");
+            assert!(stream || seen.iter().all(|r| r.0 != id || r.1 != 2));
+            // a broken connection answers every command
+            assert!(err.is_none() || done == 1, "command {id} got no answer");
+        }
+        for (i, r) in seen.iter().enumerate() {
+            assert!(ids.iter().any(|x| x.0 == r.0), "record for no command");
+            // nothing after the last record of a command
+            assert!(r.1 == 2 || seen[i + 1..].iter().all(|x| x.0 != r.0));
+        }
+        Outcome {
+            ready,
+            err: err.as_ref().map(text),
+            out: c.out.len(),
+            phase: std::mem::discriminant(&c.phase),
+            waits: c.waits.len(),
+        }
+    }
+
+    /// The read side of a connection on bytes of a server (a broken or a
+    /// hostile one): the login, the answers to commands, the records for
+    /// Dart. Byte 0: flags (1 TCP socket, 2 cleartext plugin allowed, 4
+    /// ready connection with commands, 8 MariaDB, 16 the server closes the
+    /// socket at the end). Byte 1 seeds the sizes
+    /// of the pieces. A ready connection: byte 2 is the command count and
+    /// then one byte for each command. The rest is what the server sends.
+    pub fn conn(data: &[u8]) {
+        let [flags, seed, rest @ ..] = data else {
+            return;
+        };
+        let (cmds, wire) = if flags & 4 != 0 {
+            let Some((n, r)) = rest.split_first() else {
+                return;
+            };
+            r.split_at((usize::from(*n) % 6 + 1).min(r.len()))
+        } else {
+            (&[][..], rest)
+        };
+        let whole = run(*flags, *seed, cmds, wire, false);
+        let pieces = run(*flags, *seed, cmds, wire, true);
+        // the pieces do not change what comes out. A reply with an RSA
+        // encrypted password is never the same, but has the same size.
+        assert_eq!(whole, pieces);
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::harness::{feed, new_conn, records, text, wait};
+    #[cfg(unix)]
+    use super::{Cmd, What};
     use super::{dial_fail, is_ddl};
     use crate::{Fail, parse_url};
+
+    #[cfg(unix)]
+    fn framed(seq: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        crate::proto::packet(&mut out, seq, payload);
+        out
+    }
+
+    /// A column definition with this name, a VAR_STRING.
+    #[cfg(unix)]
+    fn column(name: &[u8]) -> Vec<u8> {
+        let mut d = Vec::new();
+        for part in [&b"def"[..], b"db", b"t", b"t"] {
+            d.push(part.len() as u8);
+            d.extend_from_slice(part);
+        }
+        d.push(0xFD);
+        d.extend_from_slice(&(name.len() as u32).to_le_bytes()[..3]);
+        d.extend_from_slice(name);
+        d.extend_from_slice(&[0, 0x0c, 45, 0, 0, 0, 0, 0, 253, 0, 0, 0, 0, 0]);
+        d
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_column_name_over_65535_bytes_is_a_clean_error() {
+        // the record has the length of a name in 2 bytes: a longer name
+        // would shift every byte after it
+        let mut c = new_conn(false, false, true);
+        let mut ready = Vec::new();
+        let what = What::Result {
+            rows: true,
+            binary: false,
+        };
+        c.put(Cmd::Query(wait(1, what), "SELECT 1".into()), &mut ready);
+        let mut wire = framed(1, &[1]);
+        wire.extend(framed(2, &column(&vec![b'a'; 70_000])));
+        let err = feed(&mut c, &mut ready, &wire).unwrap_err();
+        assert!(text(&err).contains("bad packet"), "{}", text(&err));
+        // the command got an error record that Dart can read
+        assert_eq!(records(&ready).unwrap(), vec![(1, 1)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_nonce_after_an_auth_switch_is_a_clean_error() {
+        use rsa::Generate;
+        use rsa::pkcs8::{EncodePublicKey, LineEnding};
+        let pem = rsa::PrivateKey::generate()
+            .to_public_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+        // a TCP socket: the password may not go in clear
+        let mut c = new_conn(true, false, false);
+        let mut ready = Vec::new();
+        let mut greeting = b"\x0a8.4.0\0".to_vec();
+        greeting.extend_from_slice(&7u32.to_le_bytes());
+        greeting.extend_from_slice(b"abcdefgh\0");
+        greeting.extend_from_slice(&0x8000u16.to_le_bytes());
+        greeting.extend_from_slice(&[45, 2, 0, 8, 0, 21]);
+        greeting.extend_from_slice(&[0; 10]);
+        greeting.extend_from_slice(b"ijklmnopqrst\0caching_sha2_password\0");
+        feed(&mut c, &mut ready, &framed(0, &greeting)).unwrap();
+        // switch to the same plugin with no nonce, ask for the full login,
+        // then send the key
+        feed(
+            &mut c,
+            &mut ready,
+            &framed(2, b"\xfecaching_sha2_password\0"),
+        )
+        .unwrap();
+        feed(&mut c, &mut ready, &framed(4, &[1, 4])).unwrap();
+        let mut key = vec![1];
+        key.extend_from_slice(pem.as_bytes());
+        let err = feed(&mut c, &mut ready, &framed(6, &key)).unwrap_err();
+        assert!(text(&err).contains("nonce is empty"), "{}", text(&err));
+    }
 
     #[test]
     fn connect_error_names_host_and_port() {
