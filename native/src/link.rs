@@ -331,11 +331,13 @@ impl Wait {
     }
 }
 
-/// A kill connection: it only sends `KILL QUERY` for a cancelled request.
+/// A kill connection: it only sends `KILL QUERY` for a cancelled request,
+/// or `KILL` for a connection that timed out.
 struct Kill {
-    /// the connection (key) and the request (id) to stop
-    target: usize,
-    id: u64,
+    /// the connection (key) and the request (id) to stop. None: the
+    /// connection timed out and is closed here, so `KILL` its server
+    /// thread (nothing else of ours can run there any more).
+    target: Option<(usize, u64)>,
     /// the connection id on the server
     thread: u32,
     /// KILL QUERY is sent
@@ -1821,14 +1823,15 @@ impl Core {
             let Some(kill) = &self.conns[k].kill else {
                 continue;
             };
-            let (target, id, thread) = (kill.target, kill.id, kill.thread);
+            let (target, thread) = (kill.target, kill.thread);
             // the request still runs, alone: else KILL could hit the next
             // command (in a transaction, more commands can come after the
             // kill started). Then it drains.
-            let runs = self
-                .conns
-                .get(target)
-                .is_some_and(|t| t.waits.len() == 1 && t.held.is_empty() && t.waits[0].id == id);
+            let runs = target.is_none_or(|(target, id)| {
+                self.conns
+                    .get(target)
+                    .is_some_and(|t| t.waits.len() == 1 && t.held.is_empty() && t.waits[0].id == id)
+            });
             if !runs {
                 close.push(k);
                 continue;
@@ -1838,10 +1841,11 @@ impl Core {
                 kill.sent = true;
             }
             let w = Wait::new(0, What::Kill, now + c.shared.opts.timeout);
-            c.put(
-                Cmd::Query(w, format!("KILL QUERY {thread}")),
-                &mut self.ready,
-            );
+            let sql = match target {
+                Some(_) => format!("KILL QUERY {thread}"),
+                None => format!("KILL {thread}"),
+            };
+            c.put(Cmd::Query(w, sql), &mut self.ready);
         }
         for k in close {
             self.close(k, None);
@@ -1862,14 +1866,22 @@ impl Core {
             }
         }
         for (target, id, thread, shared) in start {
-            let until = now + shared.opts.timeout;
-            // it can not connect: the request drains
+            self.start_kill(shared, thread, Some((target, id)));
+        }
+    }
+
+    /// Opens a kill connection for server thread `thread` (see [Kill]).
+    /// When it can not connect, nothing is killed: a cancelled request
+    /// drains.
+    fn start_kill(&mut self, shared: Arc<Shared>, thread: u32, target: Option<(usize, u64)>) {
+        let now = self.now;
+        let until = now + shared.opts.timeout;
+        {
             let Ok(mut c) = Conn::start(shared, now) else {
-                continue;
+                return;
             };
             c.kill = Some(Kill {
                 target,
-                id,
                 thread,
                 sent: false,
                 until,
@@ -2400,7 +2412,17 @@ impl Core {
             }
         }
         for k in dead {
-            let t = self.conns[k].shared.opts.timeout;
+            let c = &self.conns[k];
+            let t = c.shared.opts.timeout;
+            // closing the socket does not stop the query: the server only
+            // sees it when it writes. So kill its server thread.
+            if c.kill.is_none() && c.thread != 0 && !c.waits.is_empty() {
+                let (shared, thread) = (c.shared.clone(), c.thread);
+                self.start_kill(shared, thread, None);
+                // wake to give up on it, if it can not log in
+                let until = now + t;
+                next = Some(next.map_or(until, |n| n.min(until)));
+            }
             self.close(k, Some(timed_out(t)));
         }
         self.next = next;

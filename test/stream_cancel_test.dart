@@ -75,6 +75,45 @@ void main() {
     pool.close();
   });
 
+  test('a query over requestTimeout is stopped on the server', () async {
+    MysqlNativePool pool = open(
+      cache: 57,
+      max: 1,
+      requestTimeout: const Duration(seconds: 1),
+    );
+    MysqlNativePool other = open(cache: 58);
+    await expectLater(
+      pool.query('/* mn_timed_out */ SELECT SLEEP(8)'),
+      throwsA(isA<MysqlException>()),
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 500));
+    MysqlNativeResult running = await other.query(
+      'SELECT ID FROM information_schema.PROCESSLIST WHERE INFO LIKE ?',
+      parameters: <Object?>['/* mn_timed_out */%'],
+    );
+    expect(running.rows, isEmpty);
+    pool.close();
+    other.close();
+  });
+
+  test('stopping a stream early in a transaction never kills the next '
+      'query', () async {
+    MysqlNativePool pool = open(cache: 59, max: 2);
+    for (int i = 0; i < 100; i++) {
+      int tx = await pool.begin();
+      // big and small results: the stream still runs, or just ended
+      String sql = rowsSql(i.isEven ? 4 : 1);
+      MysqlNativeResult first = await pool
+          .stream(sql, transaction: tx, chunkSize: 5)
+          .first;
+      expect(first.rows, hasLength(5));
+      MysqlNativeResult r = await pool.query('SELECT 1 AS a', transaction: tx);
+      expect(r.rows.single['a'], 1, reason: 'round $i');
+      await pool.commit(tx);
+    }
+    pool.close();
+  }, timeout: const Timeout(Duration(minutes: 2)));
+
   test('cancel stops a long query on the server', () async {
     MysqlNativePool pool = open(cache: 42, max: 1);
     MysqlCancelToken token = MysqlCancelToken();
