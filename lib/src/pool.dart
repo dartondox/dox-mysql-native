@@ -901,7 +901,12 @@ class _Link {
   }
 
   static String _text(Uint8List b, int at, int len) {
-    return utf8.decode(Uint8List.sublistView(b, at, at + len));
+    // a bad byte gives U+FFFD. A throw here would stop the whole batch of
+    // results, and the request would never finish.
+    return utf8.decode(
+      Uint8List.sublistView(b, at, at + len),
+      allowMalformed: true,
+    );
   }
 
   /// MariaDB: text that is a JSON object or array is decoded

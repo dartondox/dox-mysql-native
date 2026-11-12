@@ -155,6 +155,34 @@ These are accepted and do nothing:
 
 An unknown option is an error.
 
+## Fuzzing
+
+The code that reads what the server sends has fuzz targets in `native/fuzz/`. CI runs each one for 60 seconds when `native/` changes.
+
+- `packets`: splits bytes into packets, also when they come in small pieces, and joins big packets. Checks: the pieces give the same packets as the whole.
+- `rows`: column definitions, then rows in the text and the binary format. Checks: no panic, a bounded result.
+- `handshake`: the greeting, auth switch, OK, ERR and end packets, and the length-encoded numbers and strings. Checks: reads stay inside the bytes.
+- `conn`: a whole connection (login, then answers to commands) fed with bytes of a broken server, all at once and in random pieces. Checks: no panic, the same result both ways, bounded memory, each command gets one answer, and every record for Dart can be read the way `lib/src/pool.dart` reads it.
+- `roundtrip`: what we write we read back (length numbers, packets with the split and join, text and binary rows built like a server does). Checks: the same value comes back, and a cut row is never read as a whole.
+
+To run one locally:
+
+```sh
+rustup toolchain install nightly
+cargo install cargo-fuzz --locked
+cd native
+cp Cargo.lock fuzz/Cargo.lock
+mkdir -p /tmp/corpus/conn
+cargo +nightly fuzz run conn /tmp/corpus/conn fuzz/corpus/conn -- -max_total_time=300 -max_len=8192 -timeout=10
+```
+
+Use the name of the other targets in the same way (`packets`, `rows`, `handshake`, `roundtrip`).
+
+- The first folder gets the new inputs the fuzzer finds. Use a temp folder, so `fuzz/corpus/` keeps only the small seed files. Commit a new seed there only when it is useful.
+- In fuzz builds only, a packet of 1024 bytes counts as a full one (the real size is 0xFFFFFF). So the code that joins packets is reached with small inputs (a few KB). The release library is not changed.
+- A crash stops the run. The input that caused it is in `fuzz/artifacts/<target>/`. Run it again with `cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<file>`.
+- The fuzz crate builds the same source as `native/`. Keep the dependencies in `native/fuzz/Cargo.toml` the same as in `native/Cargo.toml`. CI checks this.
+
 ## Documentation
 
 - [Native MySQL driver](https://dartondox.dev/latest/database/mysql-native/)

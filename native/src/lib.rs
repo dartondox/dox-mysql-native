@@ -53,6 +53,16 @@ mod tls;
 
 use proto::Value;
 
+// the entry points of the fuzz targets in `fuzz/`, see `proto::fuzz` and
+// `link::fuzz`
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzz {
+    #[cfg(unix)]
+    pub use crate::link::fuzz::conn;
+    pub use crate::proto::fuzz::*;
+}
+
 /// Bump when the FFI functions or the record layout change.
 const ABI_VERSION: i32 = 3;
 
@@ -650,7 +660,8 @@ fn parse_date(b: &[u8]) -> Option<DateParts> {
     let sec = num(17..19)? as u8;
     let mut us = 0;
     if let Some(frac) = s.get(20..).filter(|f| !f.is_empty()) {
-        let digits = &frac[..frac.len().min(6)];
+        // get: the cut can be inside a multi-byte char of a bad text
+        let digits = frac.get(..frac.len().min(6))?;
         us = digits.parse::<u32>().ok()? * 10u32.pow(6 - digits.len() as u32);
     }
     Some((y, mo, d, h, mi, sec, us))
@@ -658,7 +669,8 @@ fn parse_date(b: &[u8]) -> Option<DateParts> {
 
 fn time_text(neg: bool, days: u32, h: u8, m: u8, s: u8, us: u32) -> String {
     let sign = if neg { "-" } else { "" };
-    let hours = days * 24 + u32::from(h);
+    // days is a u32 from the server: u32 would overflow over 178956970 days
+    let hours = u64::from(days) * 24 + u64::from(h);
     if us == 0 {
         format!("{sign}{hours:02}:{m:02}:{s:02}")
     } else {
@@ -999,6 +1011,21 @@ mod tests {
             Some((2024, 2, 29, 13, 14, 15, 500_000))
         );
         assert_eq!(parse_date(b"nope"), None);
+        // a cut of the fraction inside a multi-byte char must not panic
+        assert_eq!(
+            parse_date("2024-02-29 13:14:15.12345\u{2bf}".as_bytes()),
+            None
+        );
+    }
+
+    #[test]
+    fn time_text_with_many_days() {
+        assert_eq!(time_text(true, 1, 2, 3, 4, 0), "-26:03:04");
+        // the days of a binary TIME is a u32: the hours must not overflow
+        assert_eq!(
+            time_text(false, u32::MAX, 5, 6, 7, 8),
+            "103079215085:06:07.000008"
+        );
     }
 
     #[test]

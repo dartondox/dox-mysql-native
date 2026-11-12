@@ -1,5 +1,11 @@
 ## Unreleased
 
+- New fuzz targets for the code that reads the server bytes (packets, rows, login packets, a whole connection, round trips), run by CI. They found these bugs, all fixed:
+  - Fix: a server that sent an auth switch with no nonce, then asked for the RSA login, made the process abort (a divide by zero). Now the login fails with an error.
+  - Fix: a DATETIME text with a multi-byte char in the fraction made the process abort. Now it stays text.
+  - Fix: the hours of a binary TIME with a huge day count overflowed (wrong text in the result). Now it is exact.
+  - Fix: a column name over 65535 bytes made a result record that Dart read wrong. Now the query fails with an error.
+  - Fix: a text value that is not valid UTF-8 made Dart throw inside the result loop, so the request never finished. Now bad bytes become U+FFFD.
 - New pool settings in `MysqlNativePool.open()`. All are optional, and the defaults keep the old behavior:
   - `requestTimeout` (default 300 s): the longest wait for one request. Before, it was fixed at 300 s. URL option `request_timeout_ms`.
 - Fix: a query over its timeout kept running on the server until it ended. Closing the socket does not stop it. Now its server thread gets a `KILL` from a new connection.

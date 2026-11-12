@@ -37,7 +37,13 @@ pub(crate) const COM_STMT_CLOSE: u8 = 0x19;
 /// utf8mb4_general_ci, like mysql_async
 const CHARSET: u8 = 45;
 const MAX_PACKET: u32 = 16 * 1024 * 1024;
+#[cfg(not(fuzzing))]
 const FULL: usize = 0xFF_FFFF;
+/// In `cargo fuzz` builds only: a small size, so the fuzzer reaches the
+/// code that joins packets with inputs of a few KB. The release library
+/// always uses 0xFF_FFFF.
+#[cfg(fuzzing)]
+const FULL: usize = 0x400;
 
 /// Column flags
 const UNSIGNED: u16 = 32;
@@ -329,6 +335,10 @@ pub(crate) fn rsa_password(pem: &[u8], pw: &[u8], nonce: &[u8]) -> Result<Vec<u8
         })
         .map_err(|e| bad(e.to_string()))?;
     let nonce = &nonce[..nonce.len().min(20)];
+    if nonce.is_empty() {
+        // an auth switch can send an empty nonce
+        return Err(bad("the nonce is empty".into()));
+    }
     let mut data = pw.to_vec();
     data.push(0);
     for (i, b) in data.iter_mut().enumerate() {
@@ -617,6 +627,435 @@ pub(crate) fn execute(out: &mut Vec<u8>, id: u32, params: &[Param]) {
     end_packet(out, at, 0);
 }
 
+/// Entry points for the fuzz targets in `fuzz/`. Only in `cargo fuzz`
+/// builds (`--cfg fuzzing`), not in the library.
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzz {
+    use super::*;
+
+    /// `FULL` in these builds, for the seeds and the harness.
+    pub const FULL_PACKET: usize = FULL;
+
+    fn all(b: &[u8]) -> Vec<(Vec<u8>, u8)> {
+        let (mut p, mut v) = (0, Vec::new());
+        while let Some((payload, seq, used)) = next_packet(&b[p..]) {
+            assert!(used >= 4 && used <= b.len() - p);
+            p += used;
+            v.push((payload.into_owned(), seq));
+        }
+        v
+    }
+
+    /// `next_packet` in a loop, the way `Conn::process` calls it. Then the
+    /// same bytes in random pieces, like socket reads: the packets must be
+    /// the same.
+    pub fn packets(data: &[u8]) {
+        // the first byte seeds the piece sizes
+        let (seed, data) = data.split_first().map_or((0, data), |(s, d)| (*s, d));
+        let want = all(data);
+        let (mut end, mut rng, mut p) = (0, u32::from(seed) | 1, 0);
+        let mut got = Vec::new();
+        while end < data.len() {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            end = (end + 1 + rng as usize % 700).min(data.len());
+            while let Some((payload, seq, used)) = next_packet(&data[p..end]) {
+                p += used;
+                got.push((payload.into_owned(), seq));
+            }
+        }
+        assert!(got == want);
+    }
+
+    /// The column parser on raw bytes. Then column definitions built from
+    /// the input (a count, then 4 bytes for each column) and a row (the
+    /// rest) in both row formats.
+    pub fn rows(data: &[u8]) {
+        // the parser on raw bytes
+        let _ = column(data);
+        let Some((&n, rest)) = data.split_first() else {
+            return;
+        };
+        let n = usize::from(n % 9);
+        let (spec, row) = rest.split_at((n * 4).min(rest.len()));
+        let mut cols = Vec::new();
+        for s in spec.as_chunks::<4>().0 {
+            let mut def = Vec::new();
+            for part in [&b""[..], b"", b"", b"", b"c", b"c"] {
+                put_lenenc_bytes(&mut def, part);
+            }
+            def.push(0x0c);
+            let charset: u16 = if s[3] & 1 == 0 { 45 } else { 63 };
+            def.extend_from_slice(&charset.to_le_bytes());
+            def.extend_from_slice(&u32::from(s[3] >> 1).to_le_bytes());
+            def.push(s[0]);
+            def.extend_from_slice(&[s[1], s[2], 0, 0]);
+            let c = column(&def).expect("a valid column definition");
+            assert!(c.ty == s[0] && c.name == b"c");
+            assert_eq!(c.unsigned, u16::from_le_bytes([s[1], s[2]]) & UNSIGNED != 0);
+            cols.push(c);
+        }
+        // a cell is the bytes of the row plus a small head or text
+        let max = cols.len() * (row.len() + 64);
+        let mut out = Vec::new();
+        let text = text_row(&mut out, row, &cols);
+        assert!(out.len() <= max);
+        if text.is_some() {
+            assert!(out.len() >= cols.len());
+        }
+        out.clear();
+        let _ = binary_row(&mut out, row, &cols);
+        assert!(out.len() <= max);
+    }
+
+    /// The small parsers of the login and of results.
+    pub fn handshake(data: &[u8]) {
+        if let Ok(g) = greeting(data) {
+            assert!(g.nonce.len() <= data.len());
+        }
+        let (plugin, nonce) = auth_switch(data);
+        assert!(plugin.len() <= data.len() * 3 && nonce.len() <= data.len());
+        let _ = ok_packet(data);
+        let _ = err_packet(data);
+        assert_eq!(
+            is_end(data),
+            data.first() == Some(&0xFE) && data.len() < FULL
+        );
+        // read at every offset
+        for start in 0..data.len().min(32) {
+            let mut p = start;
+            match lenenc(data, &mut p) {
+                Some(_) => assert!(p > start && p <= data.len()),
+                None => assert_eq!(p, start),
+            }
+            let mut p = start;
+            match lenenc_bytes(data, &mut p) {
+                Some(s) => assert!(p >= start && p <= data.len() && s.len() <= data.len()),
+                None => assert!(p >= start),
+            }
+        }
+    }
+    /// A column definition with this type, flags, charset and length.
+    fn col_def(ty: u8, flags: u16, charset: u16, length: u32) -> Vec<u8> {
+        let mut def = Vec::new();
+        for part in [&b""[..], b"", b"", b"", b"c", b"c"] {
+            put_lenenc_bytes(&mut def, part);
+        }
+        def.push(0x0c);
+        def.extend_from_slice(&charset.to_le_bytes());
+        def.extend_from_slice(&length.to_le_bytes());
+        def.push(ty);
+        def.extend_from_slice(&flags.to_le_bytes());
+        def.extend_from_slice(&[0, 0]);
+        def
+    }
+
+    /// The bytes of the input, then 0 bytes.
+    struct Take<'a>(&'a [u8]);
+
+    impl Take<'_> {
+        fn bytes(&mut self, n: usize) -> Vec<u8> {
+            let k = n.min(self.0.len());
+            let mut v = self.0[..k].to_vec();
+            self.0 = &self.0[k..];
+            v.resize(n, 0);
+            v
+        }
+        fn byte(&mut self) -> u8 {
+            self.bytes(1)[0]
+        }
+    }
+
+    /// Things we write and read again must give the same thing: length
+    /// numbers, packets (also split in parts), and rows that we build the
+    /// way a server does, in the text and the binary format.
+    pub fn roundtrip(data: &[u8]) {
+        // length-encoded numbers: the shortest form, and back
+        let mut t = Take(data);
+        let v = u64::from_le_bytes(t.bytes(8).try_into().unwrap()) >> (t.byte() % 64);
+        let mut out = Vec::new();
+        put_lenenc(&mut out, v);
+        let want = match v {
+            0..=250 => 1,
+            251..=0xFFFF => 3,
+            0x1_0000..=0xFF_FFFF => 4,
+            _ => 9,
+        };
+        assert_eq!(out.len(), want);
+        let mut p = 0;
+        assert_eq!(lenenc(&out, &mut p), Some(v));
+        assert_eq!(p, out.len());
+        let mut out = Vec::new();
+        put_lenenc_bytes(&mut out, data);
+        let mut p = 0;
+        assert_eq!(lenenc_bytes(&out, &mut p), Some(data));
+        assert_eq!(p, out.len());
+
+        // packets: after other bytes, and with a payload over FULL bytes
+        // (split in parts, joined again). The sequence id is the one of
+        // the last part.
+        let (seq, payload) = data.split_first().map_or((0, data), |(s, d)| (*s, d));
+        let exact = vec![seq; FULL * (1 + usize::from(seq) % 3)];
+        for payload in [
+            payload,
+            &payload.repeat(FULL / payload.len().max(1) * 2 + 1),
+            &exact,
+        ] {
+            let mut out = vec![0xAA, 0xBB];
+            packet(&mut out, seq, payload);
+            assert_eq!(out[..2], [0xAA, 0xBB]);
+            let (got, last, used) = next_packet(&out[2..]).expect("a whole packet");
+            assert!(*got == *payload);
+            assert_eq!(used, out.len() - 2);
+            assert_eq!(last, seq.wrapping_add((payload.len() / FULL) as u8));
+            // one byte less is not a whole packet
+            assert!(next_packet(&out[2..out.len() - 1]).is_none());
+            // the same packet written in 2 steps
+            let mut out2 = vec![0xAA, 0xBB];
+            let at = start_packet(&mut out2);
+            out2.extend_from_slice(&payload[..payload.len() / 2]);
+            out2.extend_from_slice(&payload[payload.len() / 2..]);
+            end_packet(&mut out2, at, seq);
+            assert!(out == out2);
+        }
+
+        // rows
+        let mut t = Take(data);
+        let n = 1 + usize::from(t.byte() % 6);
+        let (mut defs, mut nulls, mut bin, mut txt) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut want_bin, mut want_txt) = (Vec::new(), Vec::new());
+        for _ in 0..n {
+            let (sel, null) = (t.byte() % 15, t.byte() & 1 == 1);
+            let mut b = Vec::new();
+            let mut s = Vec::new();
+            let (ty, flags, value): (u8, u16, Value) = match sel {
+                0 => (1, 0, Value::Int(i64::from(t.byte() as i8))),
+                1 => (1, UNSIGNED, Value::Int(i64::from(t.byte()))),
+                2 => (
+                    2,
+                    0,
+                    Value::Int(i64::from(i16::from_le_bytes(
+                        t.bytes(2).try_into().unwrap(),
+                    ))),
+                ),
+                3 => (
+                    2,
+                    UNSIGNED,
+                    Value::Int(i64::from(u16::from_le_bytes(
+                        t.bytes(2).try_into().unwrap(),
+                    ))),
+                ),
+                4 => (
+                    3,
+                    0,
+                    Value::Int(i64::from(i32::from_le_bytes(
+                        t.bytes(4).try_into().unwrap(),
+                    ))),
+                ),
+                5 => (
+                    3,
+                    UNSIGNED,
+                    Value::Int(i64::from(u32::from_le_bytes(
+                        t.bytes(4).try_into().unwrap(),
+                    ))),
+                ),
+                6 => (
+                    8,
+                    0,
+                    Value::Int(i64::from_le_bytes(t.bytes(8).try_into().unwrap())),
+                ),
+                7 => (
+                    8,
+                    UNSIGNED,
+                    Value::UInt(u64::from_le_bytes(t.bytes(8).try_into().unwrap())),
+                ),
+                8 => (
+                    4,
+                    0,
+                    Value::Float(f32::from_le_bytes(t.bytes(4).try_into().unwrap())),
+                ),
+                9 => (
+                    5,
+                    0,
+                    Value::Double(f64::from_le_bytes(t.bytes(8).try_into().unwrap())),
+                ),
+                10 => {
+                    let len = usize::from(t.byte() % 20);
+                    s = t.bytes(len);
+                    (253, 0, Value::Null)
+                }
+                11 => {
+                    let k = usize::from(t.byte() % 4);
+                    let d = t.bytes([0, 4, 7, 11][k]);
+                    let at = |i: usize| d.get(i).copied().unwrap_or(0);
+                    let year = if d.len() >= 2 {
+                        u16::from_le_bytes([d[0], d[1]])
+                    } else {
+                        0
+                    };
+                    let us = if d.len() == 11 {
+                        u32::from_le_bytes([d[7], d[8], d[9], d[10]])
+                    } else {
+                        0
+                    };
+                    let v = Value::Date(year, at(2), at(3), at(4), at(5), at(6), us);
+                    (12, 0, v)
+                }
+                12 => {
+                    let k = usize::from(t.byte() % 3);
+                    let d = t.bytes([0, 8, 12][k]);
+                    let v = if d.is_empty() {
+                        Value::Time(false, 0, 0, 0, 0, 0)
+                    } else {
+                        let us = if d.len() == 12 {
+                            u32::from_le_bytes([d[8], d[9], d[10], d[11]])
+                        } else {
+                            0
+                        };
+                        Value::Time(
+                            d[0] == 1,
+                            u32::from_le_bytes([d[1], d[2], d[3], d[4]]),
+                            d[5],
+                            d[6],
+                            d[7],
+                            us,
+                        )
+                    };
+                    (11, 0, v)
+                }
+                13 => (
+                    13,
+                    0,
+                    Value::Int(i64::from(u16::from_le_bytes(
+                        t.bytes(2).try_into().unwrap(),
+                    ))),
+                ),
+                _ => (6, 0, Value::Null),
+            };
+            let value = if sel == 10 { Value::Bytes(&s) } else { value };
+            // what a server writes for this value in the binary format
+            match &value {
+                Value::Int(v) => match ty {
+                    1 => b.push(*v as u8),
+                    2 | 13 => b.extend_from_slice(&(*v as u16).to_le_bytes()),
+                    3 => b.extend_from_slice(&(*v as u32).to_le_bytes()),
+                    _ => b.extend_from_slice(&v.to_le_bytes()),
+                },
+                Value::UInt(v) => b.extend_from_slice(&v.to_le_bytes()),
+                Value::Float(v) => b.extend_from_slice(&v.to_le_bytes()),
+                Value::Double(v) => b.extend_from_slice(&v.to_le_bytes()),
+                Value::Bytes(v) => put_lenenc_bytes(&mut b, v),
+                Value::Date(y, mo, d, h, mi, s, us) => {
+                    // the shortest form that has all the parts
+                    let n = if *us != 0 {
+                        11
+                    } else if (*h, *mi, *s) != (0, 0, 0) {
+                        7
+                    } else if (*y, *mo, *d) != (0, 0, 0) {
+                        4
+                    } else {
+                        0
+                    };
+                    b.push(n);
+                    let all = [y.to_le_bytes()[0], y.to_le_bytes()[1], *mo, *d, *h, *mi, *s];
+                    b.extend_from_slice(&all[..n.min(7) as usize]);
+                    if n == 11 {
+                        b.extend_from_slice(&us.to_le_bytes());
+                    }
+                }
+                Value::Time(neg, days, h, m, s, us) => {
+                    let n = if *us != 0 {
+                        12
+                    } else if (*days, *h, *m, *s) != (0, 0, 0, 0) || *neg {
+                        8
+                    } else {
+                        0
+                    };
+                    b.push(n);
+                    if n > 0 {
+                        b.push(u8::from(*neg));
+                        b.extend_from_slice(&days.to_le_bytes());
+                        b.extend_from_slice(&[*h, *m, *s]);
+                    }
+                    if n == 12 {
+                        b.extend_from_slice(&us.to_le_bytes());
+                    }
+                }
+                Value::Null => {}
+            }
+            let def = col_def(ty, flags, 45, 0);
+            let col = column(&def).expect("a valid column definition");
+            nulls.push(null);
+            if null {
+                cell(&mut want_bin, col.kind, Value::Null);
+            } else {
+                bin.extend_from_slice(&b);
+                cell(&mut want_bin, col.kind, value);
+            }
+            // the text format: the text of the value is what the server
+            // sends. We have no text of the number, so use these bytes.
+            let k = usize::from(t.byte() % 12);
+            let text = t.bytes(k);
+            if null {
+                txt.push(0xFB);
+                cell(&mut want_txt, col.kind, Value::Null);
+            } else {
+                put_lenenc_bytes(&mut txt, &text);
+                cell(&mut want_txt, col.kind, Value::Bytes(&text));
+            }
+            defs.push(col);
+        }
+        let mut row = vec![0u8; 1 + (n + 9) / 8];
+        for (i, null) in nulls.iter().enumerate() {
+            if *null {
+                row[1 + (i + 2) / 8] |= 1 << ((i + 2) % 8);
+            }
+        }
+        row.extend_from_slice(&bin);
+        for (row, txt_row, want, cut_ok) in [
+            (&row, false, &want_bin, true),
+            (&txt, true, &want_txt, true),
+        ] {
+            let _ = cut_ok;
+            let mut out = Vec::new();
+            let r = if txt_row {
+                text_row(&mut out, row, &defs)
+            } else {
+                binary_row(&mut out, row, &defs)
+            };
+            assert!(r.is_some());
+            assert!(out == *want);
+            // bytes after the row are not read
+            let mut longer = row.clone();
+            longer.push(0xAB);
+            let mut out = Vec::new();
+            let _ = if txt_row {
+                text_row(&mut out, &longer, &defs)
+            } else {
+                binary_row(&mut out, &longer, &defs)
+            };
+            assert!(out == *want);
+            // a row that is cut is never read as a whole
+            for cut in 0..row.len() {
+                let mut out = Vec::new();
+                let r = if txt_row {
+                    text_row(&mut out, &row[..cut], &defs)
+                } else {
+                    binary_row(&mut out, &row[..cut], &defs)
+                };
+                assert!(
+                    r.is_none(),
+                    "a row cut to {cut} of {} bytes was read",
+                    row.len()
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,11 +1076,14 @@ mod tests {
             *b ^= nonce[i];
         }
         // the server sends the PEM with a 0 byte at the end
+        let pkcs1_pem = pkcs1.clone();
         for pem in [format!("{spki}\0"), pkcs1] {
             let enc = rsa_password(pem.as_bytes(), b"secret", &nonce).unwrap();
             assert_eq!(private.oaep_decrypt::<sha1::Sha1>(&enc).unwrap(), want);
         }
         assert!(rsa_password(b"not a key", b"secret", &nonce).is_err());
+        // an auth switch can send an empty nonce: an error, not a panic
+        assert!(rsa_password(pkcs1_pem.as_bytes(), b"secret", &[]).is_err());
     }
 
     #[test]
