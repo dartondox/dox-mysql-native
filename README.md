@@ -5,7 +5,7 @@ Native MySQL and MariaDB client for Dart. It is the default MySQL driver of the 
 [![pub package](https://img.shields.io/pub/v/dox_mysql_native.svg)](https://pub.dev/packages/dox_mysql_native)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/dartondox/dox-mysql-native/blob/main/LICENSE)
 
-Part of [Dox](https://dartondox.dev), a web backend framework for Dart, like Laravel.
+Part of [Dox](https://dartondox.dev), a web backend framework for Dart.
 Source code: [github.com/dartondox/dox-mysql-native](https://github.com/dartondox/dox-mysql-native).
 
 ## Install
