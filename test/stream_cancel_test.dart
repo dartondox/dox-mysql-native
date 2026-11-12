@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:dox_mysql_native/dox_mysql_native.dart';
 import 'package:test/test.dart';
@@ -316,6 +317,72 @@ void main() {
       pool.stream('SELECT * FROM mn_no_such_table').toList(),
       throwsA(isA<MysqlException>()),
     );
+    pool.close();
+  });
+
+  test(
+    'a stream in a transaction of another isolate gets all chunks',
+    () async {
+      MysqlNativePool pool = open(cache: 55, max: 2);
+      int tx = await pool.begin();
+      int handle = pool.handle;
+      // chunk size 1: each chunk, more and the end go through the route
+      List<int> sizes = await Isolate.run(() async {
+        MysqlNativePool other = MysqlNativePool.fromHandle(handle);
+        List<int> out = <int>[];
+        await for (MysqlNativeResult r in other.stream(
+          rowsSql(1),
+          transaction: tx,
+          chunkSize: 1,
+        )) {
+          out.add(r.rows.length);
+        }
+        // a cancel from there works too
+        int chunks = 0;
+        await for (MysqlNativeResult _ in other.stream(
+          rowsSql(6),
+          transaction: tx,
+          chunkSize: 100,
+        )) {
+          if (++chunks == 2) break;
+        }
+        out.add(chunks);
+        return out;
+      }).timeout(const Duration(seconds: 20));
+      expect(sizes, <int>[...List<int>.filled(10, 1), 2]);
+      expect(
+        (await pool.query('SELECT 3 AS a', transaction: tx)).rows.single['a'],
+        3,
+      );
+      await pool.rollback(tx);
+      pool.close();
+    },
+  );
+
+  test('a cancel in a transaction never kills the next query', () async {
+    MysqlNativePool pool = open(cache: 56, max: 2);
+    int tx = await pool.begin();
+    for (int i = 0; i < 2; i++) {
+      MysqlCancelToken token = MysqlCancelToken();
+      Future<MysqlNativeResult> slow = pool.query(
+        'SELECT SLEEP(1)',
+        transaction: tx,
+        cancelToken: token,
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      token.cancel();
+      // round 0: the next query goes in the same batch as the cancel.
+      // round 1: after it, while the kill connection logs in.
+      if (i == 1) await Future<void>.delayed(Duration.zero);
+      Future<MysqlNativeResult> next = pool.query(
+        'SELECT SLEEP(0.3) AS s, 7 AS a',
+        transaction: tx,
+      );
+      await expectLater(slow, throwsA(isA<MysqlQueryCancelledException>()));
+      MysqlNativeResult r = await next;
+      expect((r.rows.single['s'], r.rows.single['a']), (0, 7));
+    }
+    await pool.commit(tx);
     pool.close();
   });
 

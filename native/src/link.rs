@@ -1822,11 +1822,13 @@ impl Core {
                 continue;
             };
             let (target, id, thread) = (kill.target, kill.id, kill.thread);
-            // the request still runs: else KILL could hit the next command
+            // the request still runs, alone: else KILL could hit the next
+            // command (in a transaction, more commands can come after the
+            // kill started). Then it drains.
             let runs = self
                 .conns
                 .get(target)
-                .is_some_and(|t| t.waits.front().is_some_and(|w| w.id == id));
+                .is_some_and(|t| t.waits.len() == 1 && t.held.is_empty() && t.waits[0].id == id);
             if !runs {
                 close.push(k);
                 continue;
@@ -1992,7 +1994,14 @@ impl Core {
             let len = u32::from_le_bytes(all[p + 12..p + 16].try_into().unwrap()) as usize;
             let rec = &all[p..p + RES_HEAD + len];
             p += RES_HEAD + len;
-            let Some((theirs, from)) = self.foreign.remove(&id) else {
+            // a chunk of a stream (status 2): more records follow, so the
+            // route stays (also for its more and cancel records)
+            let route = if rec[8] == 2 {
+                self.foreign.get(&id).cloned()
+            } else {
+                self.foreign.remove(&id)
+            };
+            let Some((theirs, from)) = route else {
                 self.ready.extend_from_slice(rec);
                 continue;
             };
