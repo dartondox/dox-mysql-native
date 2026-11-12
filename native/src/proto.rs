@@ -50,29 +50,59 @@ const UNSIGNED: u16 = 32;
 
 // ---- packets -----------------------------------------------------------
 
+/// What [next_packet] finds: a payload, its sequence id and the bytes it
+/// used (None: not all there yet), or an error.
+pub(crate) type Next<'a> = Result<Option<(Cow<'a, [u8]>, u8, usize)>, Fail>;
+
+/// The most full parts of one payload. A server limit (`max_allowed_packet`)
+/// is at most 1 GiB, which is 64 full parts and a short one. A server that
+/// sends more is broken, so we stop before the buffer grows without limit.
+#[cfg(not(fuzzing))]
+const MAX_PARTS: usize = 65;
+/// In `cargo fuzz` builds only: a small number, so the fuzzer reaches the
+/// limit with inputs of a few KB.
+#[cfg(fuzzing)]
+const MAX_PARTS: usize = 6;
+
 /// The next whole payload at the start of `b` and the bytes it used. None
-/// when it is not all there yet. A payload in more packets is joined.
-pub(crate) fn next_packet(b: &[u8]) -> Option<(Cow<'_, [u8]>, u8, usize)> {
+/// when it is not all there yet. A payload in more packets is joined. Err:
+/// the payload would have more than [MAX_PARTS] full parts.
+pub(crate) fn next_packet(b: &[u8]) -> Next<'_> {
+    next_packet_with(b, FULL, MAX_PARTS)
+}
+
+/// [next_packet] with the size of a full part and the part limit as
+/// arguments, so a test can use small ones.
+fn next_packet_with(b: &[u8], full: usize, max_parts: usize) -> Next<'_> {
     let mut p = 0;
+    let mut parts = 0;
     let mut joined: Option<Vec<u8>> = None;
     loop {
         if b.len() < p + 4 {
-            return None;
+            return Ok(None);
         }
         let len = u32::from_le_bytes([b[p], b[p + 1], b[p + 2], 0]) as usize;
         let seq = b[p + 3];
+        if len >= full {
+            parts += 1;
+            if parts >= max_parts {
+                return Err(Fail::client(
+                    "dox_mysql_native: a packet from the server is over 1 GiB",
+                ));
+            }
+        }
         if b.len() < p + 4 + len {
-            return None;
+            return Ok(None);
         }
         let part = &b[p + 4..p + 4 + len];
         p += 4 + len;
-        if len < FULL && joined.is_none() {
-            return Some((Cow::Borrowed(part), seq, p));
+        if len < full && joined.is_none() {
+            return Ok(Some((Cow::Borrowed(part), seq, p)));
         }
         let all = joined.get_or_insert_with(Vec::new);
         all.extend_from_slice(part);
-        if len < FULL {
-            return Some((Cow::Owned(joined.unwrap()), seq, p));
+        if len < full {
+            return Ok(Some((Cow::Owned(joined.unwrap()), seq, p)));
         }
     }
 }
@@ -637,36 +667,53 @@ pub mod fuzz {
     /// `FULL` in these builds, for the seeds and the harness.
     pub const FULL_PACKET: usize = FULL;
 
-    fn all(b: &[u8]) -> Vec<(Vec<u8>, u8)> {
+    /// The packets of `b` and the error text, if it ended in an error.
+    fn all(b: &[u8]) -> (Vec<(Vec<u8>, u8)>, Option<String>) {
         let (mut p, mut v) = (0, Vec::new());
-        while let Some((payload, seq, used)) = next_packet(&b[p..]) {
-            assert!(used >= 4 && used <= b.len() - p);
-            p += used;
-            v.push((payload.into_owned(), seq));
+        loop {
+            match next_packet(&b[p..]) {
+                Ok(Some((payload, seq, used))) => {
+                    assert!(used >= 4 && used <= b.len() - p);
+                    p += used;
+                    v.push((payload.into_owned(), seq));
+                }
+                Ok(None) => return (v, None),
+                Err(Fail::Client(e)) => return (v, Some(e)),
+                Err(_) => panic!("not a client error"),
+            }
         }
-        v
     }
 
     /// `next_packet` in a loop, the way `Conn::process` calls it. Then the
-    /// same bytes in random pieces, like socket reads: the packets must be
-    /// the same.
+    /// same bytes in random pieces, like socket reads: the packets and the
+    /// error must be the same.
     pub fn packets(data: &[u8]) {
         // the first byte seeds the piece sizes
         let (seed, data) = data.split_first().map_or((0, data), |(s, d)| (*s, d));
         let want = all(data);
         let (mut end, mut rng, mut p) = (0, u32::from(seed) | 1, 0);
-        let mut got = Vec::new();
-        while end < data.len() {
+        let (mut got, mut err) = (Vec::new(), None);
+        'feed: while end < data.len() {
             rng ^= rng << 13;
             rng ^= rng >> 17;
             rng ^= rng << 5;
             end = (end + 1 + rng as usize % 700).min(data.len());
-            while let Some((payload, seq, used)) = next_packet(&data[p..end]) {
-                p += used;
-                got.push((payload.into_owned(), seq));
+            loop {
+                match next_packet(&data[p..end]) {
+                    Ok(Some((payload, seq, used))) => {
+                        p += used;
+                        got.push((payload.into_owned(), seq));
+                    }
+                    Ok(None) => break,
+                    Err(Fail::Client(e)) => {
+                        err = Some(e);
+                        break 'feed;
+                    }
+                    Err(_) => panic!("not a client error"),
+                }
             }
         }
-        assert!(got == want);
+        assert!(got == want.0 && err == want.1);
     }
 
     /// The column parser on raw bytes. Then column definitions built from
@@ -797,6 +844,8 @@ pub mod fuzz {
         // (split in parts, joined again). The sequence id is the one of
         // the last part.
         let (seq, payload) = data.split_first().map_or((0, data), |(s, d)| (*s, d));
+        // at most 4 full parts, under the part limit of the fuzz builds
+        let payload = &payload[..payload.len().min(4 * FULL - 1)];
         let exact = vec![seq; FULL * (1 + usize::from(seq) % 3)];
         for payload in [
             payload,
@@ -806,12 +855,12 @@ pub mod fuzz {
             let mut out = vec![0xAA, 0xBB];
             packet(&mut out, seq, payload);
             assert_eq!(out[..2], [0xAA, 0xBB]);
-            let (got, last, used) = next_packet(&out[2..]).expect("a whole packet");
+            let (got, last, used) = next_packet(&out[2..]).unwrap().expect("a whole packet");
             assert!(*got == *payload);
             assert_eq!(used, out.len() - 2);
             assert_eq!(last, seq.wrapping_add((payload.len() / FULL) as u8));
             // one byte less is not a whole packet
-            assert!(next_packet(&out[2..out.len() - 1]).is_none());
+            assert!(next_packet(&out[2..out.len() - 1]).unwrap().is_none());
             // the same packet written in 2 steps
             let mut out2 = vec![0xAA, 0xBB];
             let at = start_packet(&mut out2);
@@ -1091,22 +1140,39 @@ mod tests {
         let mut out = Vec::new();
         packet(&mut out, 3, b"abc");
         assert_eq!(out, [3, 0, 0, 3, b'a', b'b', b'c']);
-        let (p, seq, used) = next_packet(&out).unwrap();
+        let (p, seq, used) = next_packet(&out).unwrap().unwrap();
         assert_eq!((&*p, seq, used), (&b"abc"[..], 3, 7));
-        assert!(next_packet(&out[..6]).is_none());
+        assert!(next_packet(&out[..6]).unwrap().is_none());
 
         let big = vec![7u8; FULL + 10];
         let mut out = Vec::new();
         packet(&mut out, 0, &big);
         assert_eq!(out.len(), big.len() + 8);
-        let (p, _, used) = next_packet(&out).unwrap();
+        let (p, _, used) = next_packet(&out).unwrap().unwrap();
         assert_eq!((p.len(), used), (big.len(), out.len()));
 
         // exactly FULL bytes: one full packet and an empty one
         let mut out = Vec::new();
         packet(&mut out, 0, &vec![1u8; FULL]);
         assert_eq!(out.len(), FULL + 8);
-        assert_eq!(next_packet(&out).unwrap().0.len(), FULL);
+        assert_eq!(next_packet(&out).unwrap().unwrap().0.len(), FULL);
+
+        // the part limit: 4 full parts and a short one are the most
+        let part = |out: &mut Vec<u8>, seq: u8, len: u8| {
+            out.extend_from_slice(&[len, 0, 0, seq]);
+            out.extend(std::iter::repeat_n(0u8, usize::from(len)));
+        };
+        let mut out = Vec::new();
+        for i in 0..4 {
+            part(&mut out, i, 8);
+        }
+        part(&mut out, 4, 3);
+        let (p, _, used) = next_packet_with(&out, 8, 5).unwrap().unwrap();
+        assert_eq!((p.len(), used), (35, out.len()));
+        // the 5th full part is too many, its header is enough
+        let mut out = out[..4 * 12].to_vec();
+        out.extend_from_slice(&[8, 0, 0, 4]);
+        assert!(next_packet_with(&out, 8, 5).is_err());
     }
 
     #[test]

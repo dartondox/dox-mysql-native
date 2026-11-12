@@ -984,9 +984,15 @@ impl Conn {
         let inb = std::mem::take(&mut self.inb);
         let mut p = self.in_s;
         let mut res = Ok(());
-        while !self.paused()
-            && let Some((payload, seq, used)) = proto::next_packet(&inb[p..self.in_e])
-        {
+        while !self.paused() {
+            let (payload, seq, used) = match proto::next_packet(&inb[p..self.in_e]) {
+                Ok(Some(next)) => next,
+                Ok(None) => break,
+                Err(e) => {
+                    res = Err(e);
+                    break;
+                }
+            };
             p += used;
             self.seq = seq;
             res = if self.ready() {
@@ -3017,7 +3023,13 @@ mod harness {
         room(&mut c.inb, &mut c.in_s, &mut c.in_e, bytes.len());
         c.inb[c.in_e..c.in_e + bytes.len()].copy_from_slice(bytes);
         c.in_e += bytes.len();
-        let r = c.process(ready, Instant::now());
+        let mut r = c.process(ready, Instant::now());
+        // Dart takes the chunks of a stream: more credit, like an OP_MORE
+        // request does, and read on
+        while r.is_ok() && c.paused() {
+            c.waits[0].credit += 1;
+            r = c.process(ready, Instant::now());
+        }
         if let Err(f) = &r {
             c.fail_all(f, ready);
         }
@@ -3085,7 +3097,7 @@ mod harness {
                 }
             }
             // the cells, until the body ends: rows * columns of them
-            'rows: for _ in 0..nrows {
+            for _ in 0..if ncols == 0 { 0 } else { nrows } {
                 for _ in 0..ncols {
                     let tag = *body.get(q).ok_or("a cell is missing")?;
                     q += 1;
@@ -3098,9 +3110,6 @@ mod harness {
                     };
                     if q > body.len() {
                         return Err(format!("a cell goes past the end in record of {id}"));
-                    }
-                    if q == body.len() && ncols == 0 {
-                        break 'rows;
                     }
                 }
             }
@@ -3228,6 +3237,12 @@ pub mod fuzz {
         } else {
             err = feed(&mut c, &mut ready, wire).err();
         }
+        // the server closes the socket: the commands that wait fail
+        if flags & 16 != 0 && err.is_none() {
+            let f = Fail::client("dox_mysql_native: the server closed the connection");
+            c.fail_all(&f, &mut ready);
+            err = Some(f);
+        }
         // no memory growth: the answer is not much bigger than the input
         // (a binary row of NULL columns is 1 byte for each column and 1 bit
         // in the row), and the bytes to send are small
@@ -3266,7 +3281,8 @@ pub mod fuzz {
     /// The read side of a connection on bytes of a server (a broken or a
     /// hostile one): the login, the answers to commands, the records for
     /// Dart. Byte 0: flags (1 TCP socket, 2 cleartext plugin allowed, 4
-    /// ready connection with commands, 8 MariaDB). Byte 1 seeds the sizes
+    /// ready connection with commands, 8 MariaDB, 16 the server closes the
+    /// socket at the end). Byte 1 seeds the sizes
     /// of the pieces. A ready connection: byte 2 is the command count and
     /// then one byte for each command. The rest is what the server sends.
     pub fn conn(data: &[u8]) {

@@ -159,10 +159,10 @@ An unknown option is an error.
 
 The code that reads what the server sends has fuzz targets in `native/fuzz/`. CI runs each one for 60 seconds when `native/` changes.
 
-- `packets`: splits bytes into packets, also when they come in small pieces, and joins big packets. Checks: the pieces give the same packets as the whole.
+- `packets`: splits bytes into packets, also when they come in small pieces, and joins big packets. Checks: the pieces give the same packets (or the same error for too many parts) as the whole.
 - `rows`: column definitions, then rows in the text and the binary format. Checks: no panic, a bounded result.
 - `handshake`: the greeting, auth switch, OK, ERR and end packets, and the length-encoded numbers and strings. Checks: reads stay inside the bytes.
-- `conn`: a whole connection (login, then answers to commands) fed with bytes of a broken server, all at once and in random pieces. Checks: no panic, the same result both ways, bounded memory, each command gets one answer, and every record for Dart can be read the way `lib/src/pool.dart` reads it.
+- `conn`: a whole connection (login, then answers to commands) fed with bytes of a broken server, all at once and in random pieces. Streams get more credit when they pause, and the server may close the socket at the end. Checks: no panic, the same result both ways, bounded memory, each command gets one answer, and every record for Dart can be read the way `lib/src/pool.dart` reads it.
 - `roundtrip`: what we write we read back (length numbers, packets with the split and join, text and binary rows built like a server does). Checks: the same value comes back, and a cut row is never read as a whole.
 
 To run one locally:

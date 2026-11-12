@@ -756,43 +756,85 @@ class _Link {
       p = body + len;
       _Pending? pending = _pending[id];
       if (pending == null) continue;
-      StreamController<MysqlNativeResult>? controller = pending.controller;
-      if (controller == null) {
-        _done(id);
-        if (status == 0) {
-          pending.completer!.complete(_rows(b, d, body, pending.sql));
-        } else {
-          pending.completer!.completeError(_error(b, d, body, len));
-        }
-        continue;
+      // one try for each record, not for each cell: no cost while nothing
+      // throws
+      try {
+        _record(pending, id, status, len, b, d, body);
+      } catch (e) {
+        _bad(pending, id, status, e);
       }
-      if (status == 1) {
-        _done(id);
-        controller
-          ..addError(_error(b, d, body, len))
-          ..close();
-        continue;
-      }
-      MysqlNativeResult chunk = _rows(b, d, body, pending.sql);
-      if (status == 2) {
-        pending.sent = true;
-        controller.add(chunk);
-        // the listener took it: Rust may read one more chunk. Else ask
-        // when it resumes.
-        if (_pending[id] != pending) continue; // cancelled in the listener
-        if (controller.isPaused) {
-          pending.owed++;
-        } else {
-          _control(_opMore, id, 1);
-        }
-        continue;
-      }
-      _done(id);
-      // the last rows. No empty last chunk, but one result when there was
-      // none (eg. the affected rows of an UPDATE).
-      if (chunk.rows.isNotEmpty || !pending.sent) controller.add(chunk);
-      controller.close();
     }
+  }
+
+  /// One result record of a request.
+  void _record(
+    _Pending pending,
+    int id,
+    int status,
+    int len,
+    Uint8List b,
+    ByteData d,
+    int body,
+  ) {
+    StreamController<MysqlNativeResult>? controller = pending.controller;
+    if (controller == null) {
+      _done(id);
+      if (status == 0) {
+        pending.completer!.complete(_rows(b, d, body, pending.sql));
+      } else {
+        pending.completer!.completeError(_error(b, d, body, len));
+      }
+      return;
+    }
+    if (status == 1) {
+      _done(id);
+      controller
+        ..addError(_error(b, d, body, len))
+        ..close();
+      return;
+    }
+    MysqlNativeResult chunk = _rows(b, d, body, pending.sql);
+    if (status == 2) {
+      pending.sent = true;
+      controller.add(chunk);
+      // the listener took it: Rust may read one more chunk. Else ask
+      // when it resumes.
+      if (_pending[id] != pending) return; // cancelled in the listener
+      if (controller.isPaused) {
+        pending.owed++;
+      } else {
+        _control(_opMore, id, 1);
+      }
+      return;
+    }
+    _done(id);
+    // the last rows. No empty last chunk, but one result when there was
+    // none (eg. the affected rows of an UPDATE).
+    if (chunk.rows.isNotEmpty || !pending.sent) controller.add(chunk);
+    controller.close();
+  }
+
+  /// A record could not be read (a broken server, or a bug). Only this
+  /// request fails, the other records of the batch are still read. A
+  /// stream is stopped on the Rust side too, so its connection is free.
+  void _bad(_Pending pending, int id, int status, Object e) {
+    MysqlException error = MysqlException('bad result: $e');
+    bool open = _pending[id] == pending;
+    _done(id);
+    StreamController<MysqlNativeResult>? controller = pending.controller;
+    if (controller == null) {
+      if (!pending.completer!.isCompleted) {
+        pending.completer!.completeError(error);
+      }
+      return;
+    }
+    if (!controller.isClosed) {
+      controller
+        ..addError(error)
+        ..close();
+    }
+    // a chunk (status 2): more may come, so stop the query
+    if (open && status == 2) _control(_opCancel, id, 0);
   }
 
   static MysqlException _error(Uint8List b, ByteData d, int at, int len) {
@@ -878,7 +920,7 @@ class _Link {
             } else {
               String text = _text(b, p, len);
               value = tag == _tJson
-                  ? jsonDecode(text)
+                  ? _json(text)
                   : tag == _tLongText
                   ? _maybeJson(text)
                   : text;
@@ -907,6 +949,16 @@ class _Link {
       Uint8List.sublistView(b, at, at + len),
       allowMalformed: true,
     );
+  }
+
+  /// A JSON value. Text that is not valid JSON stays text, like in
+  /// [_maybeJson], so bad data from the server does not throw.
+  static Object? _json(String text) {
+    try {
+      return jsonDecode(text);
+    } on FormatException {
+      return text;
+    }
   }
 
   /// MariaDB: text that is a JSON object or array is decoded

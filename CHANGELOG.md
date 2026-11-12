@@ -6,6 +6,10 @@
   - Fix: the hours of a binary TIME with a huge day count overflowed (wrong text in the result). Now it is exact.
   - Fix: a column name over 65535 bytes made a result record that Dart read wrong. Now the query fails with an error.
   - Fix: a text value that is not valid UTF-8 made Dart throw inside the result loop, so the request never finished. Now bad bytes become U+FFFD.
+  - Fix: a JSON value that is not valid JSON made Dart throw the same way. Now it stays text, like a JSON column of MariaDB.
+  - Fix: if Dart still can not read one result record, only that request fails (`bad result: ...`, a stream is stopped). Before, the request and the rest of the batch never finished.
+  - Fix: a packet from the server of more than 65 full parts (about 1 GiB, the most `max_allowed_packet` allows) now fails the connection. Before, a broken server could make the read buffer grow without limit.
+  - Fix: a result over 4 GiB is now an error. Before, its length field was cut.
 - New pool settings in `MysqlNativePool.open()`. All are optional, and the defaults keep the old behavior:
   - `requestTimeout` (default 300 s): the longest wait for one request. Before, it was fixed at 300 s. URL option `request_timeout_ms`.
 - Fix: a query over its timeout kept running on the server until it ended. Closing the socket does not stop it. Now its server thread gets a `KILL` from a new connection.

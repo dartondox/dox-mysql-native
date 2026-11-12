@@ -478,6 +478,12 @@ fn ok_head(affected: u64, insert_id: u64) -> Vec<u8> {
     out
 }
 
+/// The body length of a record of `total` bytes, if the 4 byte length
+/// field of the head can hold it.
+fn body_len(total: usize) -> Option<u32> {
+    u32::try_from(total - RES_HEAD).ok()
+}
+
 /// The whole result record. An ok body already has room for the head.
 fn record(id: u64, result: Result<Vec<u8>, Fail>) -> Vec<u8> {
     let (status, mut out) = match result {
@@ -506,7 +512,13 @@ fn record(id: u64, result: Result<Vec<u8>, Fail>) -> Vec<u8> {
             (1, out)
         }
     };
-    let len = (out.len() - RES_HEAD) as u32;
+    let Some(len) = body_len(out.len()) else {
+        // the length field has 4 bytes. Cold path: only a result this big.
+        return record(
+            id,
+            Err(Fail::client("dox_mysql_native: the result is over 4 GiB")),
+        );
+    };
     out[0..8].copy_from_slice(&id.to_le_bytes());
     out[8..12].copy_from_slice(&[status, 0, 0, 0]);
     out[12..16].copy_from_slice(&len.to_le_bytes());
@@ -994,6 +1006,16 @@ mod tests {
         let err = record(9, Err(Fail::Cancelled));
         assert_eq!((err[8], err[16 + 2]), (1, 2));
         assert_eq!(&err[16 + 3..16 + 8], b"70100");
+    }
+
+    #[test]
+    fn a_body_over_4_gib_is_refused() {
+        assert_eq!(body_len(RES_HEAD), Some(0));
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(body_len(RES_HEAD + u32::MAX as usize), Some(u32::MAX));
+            assert_eq!(body_len(RES_HEAD + u32::MAX as usize + 1), None);
+        }
     }
 
     #[test]
