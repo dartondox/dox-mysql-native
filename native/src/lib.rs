@@ -12,15 +12,23 @@
 //!   call) reads the answers that are there and writes the result records
 //!   into a Dart buffer. It never waits.
 //! - Each connection keeps a prepared statement cache with an LRU limit.
-//! - Each request has [TIMEOUT]. A transaction that gets no request for
-//!   [TIMEOUT] is rolled back, so its connection goes back to the pool.
+//! - Each request has a timeout (`request_timeout_ms`, 300 s by default).
+//!   A transaction that gets no request for that long is rolled back, so
+//!   its connection goes back to the pool.
+//! - A stream request (op 5) sends its rows in chunks. Each chunk is an ok
+//!   record with status 2, the last one has status 0. Rust holds at most
+//!   [CREDIT] chunks that Dart did not take yet: a more record (op 7, params:
+//!   the id and a count) lets it read on. A cancel record (op 6, param: the
+//!   id) stops a request.
 //!
 //! Request record (little endian, 32 byte head): u64 id, u64 pool, u64 tx,
 //! u8 op, 3 bytes reserved, u32 sql_len. Then u32 param count, sql, params.
+//! A stream request has the chunk size as one more int param at the end.
 //! A param is a u8 tag and a value: 0 null, 1 i64, 2 f64,
 //! 3 text (u32 len + utf8), 4 bytes (u32 len + bytes).
 //!
-//! Result record (16 byte head): u64 id, u8 status (0 ok, 1 error),
+//! Result record (16 byte head): u64 id, u8 status (0 ok, 1 error, 2 a
+//! chunk of a stream, more follow),
 //! 3 bytes reserved, u32 body_len. Then the body.
 //! - ok: u64 affected rows, u64 insert id (the tx handle for `begin`),
 //!   u32 column count, u32 row count, the names (u16 len + utf8), then each
@@ -29,7 +37,8 @@
 //!   7 json text, 8 long text (TEXT columns, MariaDB keeps JSON there).
 //!   Text, bytes and json are a u32 len and the bytes.
 //! - error: u16 server error code (0 for a client error), u8 kind
-//!   (0 server, 1 client), 5 bytes sqlstate, then the message (utf8).
+//!   (0 server, 1 client, 2 cancelled), 5 bytes sqlstate, then the message
+//!   (utf8).
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -52,6 +61,13 @@ const OP_EXECUTE: u8 = 1;
 const OP_BEGIN: u8 = 2;
 const OP_COMMIT: u8 = 3;
 const OP_ROLLBACK: u8 = 4;
+const OP_STREAM: u8 = 5;
+const OP_CANCEL: u8 = 6;
+const OP_MORE: u8 = 7;
+
+/// How many chunks of a stream Rust reads ahead of Dart. More would only
+/// cost memory: Dart asks for the next one as soon as its listener took one.
+const CREDIT: u32 = 2;
 
 const T_NULL: u8 = 0;
 const T_INT: u8 = 1;
@@ -71,12 +87,21 @@ const ENUM_FLAG: u16 = 256;
 /// Size of the head of a result record.
 const RES_HEAD: usize = 16;
 
-/// Longest wait for one request (pool slot, connect and query). Over it
-/// the request fails with a clear error, so Dart never waits forever. The
-/// same as the native Postgres driver.
-/// ponytail: fixed. Make it a pool option when an app needs another value.
+/// The default longest wait for one request (pool slot, connect and
+/// query): `request_timeout_ms`. Over it the request fails with a clear
+/// error, so Dart never waits forever. The same as the native Postgres
+/// driver.
 const TIMEOUT: Duration = Duration::from_secs(300);
-const TIMED_OUT: &str = "dox_mysql_native: timeout, no answer in 300 s";
+
+/// The error of a request over its timeout `t`.
+fn timed_out(t: Duration) -> Fail {
+    let t = if t.subsec_millis() == 0 {
+        format!("{} s", t.as_secs())
+    } else {
+        format!("{} ms", t.as_millis())
+    };
+    Fail::Client(format!("dox_mysql_native: timeout, no answer in {t}"))
+}
 const POOL_CLOSED: &str = "the pool is closed";
 
 // ---- Dart API DL -------------------------------------------------------
@@ -166,6 +191,11 @@ struct Opts {
     found_rows: bool,
     nodelay: bool,
     cleartext: bool,
+    /// the longest wait for one request (`request_timeout_ms`)
+    timeout: Duration,
+    /// stop a cancelled or timed out query on the server, with KILL on a
+    /// new connection (`server_kill`)
+    server_kill: bool,
 }
 
 const BAD_URL: &str = "not a mysql:// URL, or an unknown option or a bad option value";
@@ -212,6 +242,8 @@ fn parse_url(text: &str) -> Option<Opts> {
         found_rows: false,
         nodelay: true,
         cleartext: false,
+        timeout: TIMEOUT,
+        server_kill: true,
     };
     let mut wait_timeout = None;
     let mut tls = TlsOpts {
@@ -244,6 +276,8 @@ fn parse_url(text: &str) -> Option<Opts> {
             "abs_conn_ttl_jitter" => o.abs_jitter = Some(Duration::from_secs(num()?)),
             "inactive_connection_ttl" => o.inactive_ttl = Duration::from_secs(num()?),
             "tcp_keepalive" => o.keepalive = Some(Duration::from_millis(num()?)),
+            "server_kill" => o.server_kill = flag()?,
+            "request_timeout_ms" => o.timeout = Duration::from_millis(num()?.max(1)),
             // known to mysql_async, not used here (see README.md)
             "prefer_socket" | "secure_auth" => {
                 flag()?;
@@ -412,6 +446,8 @@ enum Fail {
         message: String,
     },
     Client(String),
+    /// the request was cancelled from Dart
+    Cancelled,
 }
 
 impl Fail {
@@ -444,6 +480,12 @@ fn record(id: u64, result: Result<Vec<u8>, Fail>) -> Vec<u8> {
                     message,
                 } => (code, 0u8, state, message),
                 Fail::Client(msg) => (0, 1, *b"HY000", msg),
+                Fail::Cancelled => (
+                    0,
+                    2,
+                    *b"70100",
+                    "dox_mysql_native: the query was cancelled".into(),
+                ),
             };
             let mut out = Vec::with_capacity(RES_HEAD + 8 + msg.len());
             out.extend_from_slice(&[0; RES_HEAD]);
@@ -894,6 +936,15 @@ mod tests {
         assert_eq!(o.abs_ttl, Some(Duration::from_secs(9)));
         assert_eq!(o.keepalive, Some(Duration::from_millis(1500)));
         assert_eq!(o.inactive_ttl, Duration::from_secs(3));
+        assert_eq!(o.timeout, TIMEOUT);
+        let o = parse_url("mysql://u@h/d?request_timeout_ms=1500").unwrap();
+        assert_eq!(o.timeout, Duration::from_millis(1500));
+        assert!(o.server_kill);
+        assert!(
+            !parse_url("mysql://u@h/d?server_kill=false")
+                .unwrap()
+                .server_kill
+        );
         assert!(o.reset);
         let o = parse_url("mysql://root@localhost/db?socket=/tmp/my.sock").unwrap();
         assert_eq!(o.socket.as_deref(), Some("/tmp/my.sock"));
@@ -916,6 +967,21 @@ mod tests {
         assert_eq!(err[8], 1);
         assert_eq!(u32::from_le_bytes(err[12..16].try_into().unwrap()), 12);
         assert_eq!(&err[16 + 8..], b"boom");
+    }
+
+    #[test]
+    fn timeout_and_cancel_errors() {
+        let Fail::Client(m) = timed_out(TIMEOUT) else {
+            panic!()
+        };
+        assert_eq!(m, "dox_mysql_native: timeout, no answer in 300 s");
+        let Fail::Client(m) = timed_out(Duration::from_millis(1500)) else {
+            panic!()
+        };
+        assert_eq!(m, "dox_mysql_native: timeout, no answer in 1500 ms");
+        let err = record(9, Err(Fail::Cancelled));
+        assert_eq!((err[8], err[16 + 2]), (1, 2));
+        assert_eq!(&err[16 + 3..16 + 8], b"70100");
     }
 
     #[test]

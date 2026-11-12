@@ -83,6 +83,29 @@ class MysqlNativePool {
   /// [maxConnections] is for the whole process: isolates that open the
   /// same settings share it.
   ///
+  /// [requestTimeout] is the longest wait for one request: a free
+  /// connection, the connect and the query. Over it the request fails
+  /// with a [MysqlException], and its connection is closed. With
+  /// [serverKill] on, a `KILL` on a new connection also stops the query on
+  /// the server. A transaction with no request for this long is rolled
+  /// back. For a [stream], the time counts from the last chunk.
+  ///
+  /// [serverKill] (default true): a cancelled or timed out query is
+  /// stopped on the server with `KILL QUERY` or `KILL`, sent on a new
+  /// connection. Turn it off when the database is behind a proxy or load
+  /// balancer: the new connection may reach another server, and then the
+  /// KILL may hit another session. Off: a cancelled query runs to its end
+  /// on the server and only its result is dropped, and a timed out query
+  /// only has its socket closed. The new connection also counts for
+  /// `max_user_connections`. A KILL that fails prints a warning on stderr.
+  ///
+  /// [maxConnectionAge] closes a connection that is older than this, once
+  /// it has no query (so a connection in use is never closed). null: no
+  /// limit. Whole seconds.
+  ///
+  /// [idleTimeout] closes a connection that had no traffic for this long,
+  /// once it has no query. null: 12 hours. Whole seconds.
+  ///
   /// [threads] is not used any more. The Rust client runs on the thread of
   /// each isolate, so there is no runtime to size. It stays so old code
   /// still compiles.
@@ -97,7 +120,10 @@ class MysqlNativePool {
     bool verifyCertificate = true,
     String? sslRootCert,
     int statementCacheSize = 32,
-    Duration maxConnectionAge = const Duration(hours: 12),
+    Duration requestTimeout = const Duration(seconds: 300),
+    Duration? maxConnectionAge,
+    Duration? idleTimeout,
+    bool serverKill = true,
     int threads = 1,
   }) {
     bool socket = host.startsWith('/');
@@ -116,7 +142,11 @@ class MysqlNativePool {
         'pool_min': '$maxConnections',
         'pool_max': '$maxConnections',
         'stmt_cache_size': '$statementCacheSize',
-        'conn_ttl': '${maxConnectionAge.inSeconds}',
+        'conn_ttl': '${(idleTimeout ?? const Duration(hours: 12)).inSeconds}',
+        if (maxConnectionAge != null)
+          'abs_conn_ttl': '${maxConnectionAge.inSeconds}',
+        'request_timeout_ms': '${requestTimeout.inMilliseconds}',
+        if (!serverKill) 'server_kill': 'false',
         if (secure) 'require_ssl': 'true',
         // sent also without TLS, so fromUrl() can warn that it is ignored
         'ssl_ca': ?sslRootCert,
@@ -203,18 +233,62 @@ class MysqlNativePool {
   /// [transaction] is an id from [begin].
   /// Throws [MysqlException]. For an error from the server it has the
   /// error `code` and the `sqlState`. For other errors they are null.
+  ///
+  /// [cancelToken] can stop the query: then it throws a
+  /// [MysqlQueryCancelledException]. See [MysqlCancelToken].
   Future<MysqlNativeResult> query(
     String sql, {
     Object? parameters,
     int transaction = 0,
-  }) => _send(_opQuery, sql, parameters, transaction);
+    MysqlCancelToken? cancelToken,
+  }) => _send(_opQuery, sql, parameters, transaction, cancelToken);
 
   /// Like [query], but the rows are not sent back to Dart.
   Future<MysqlNativeResult> execute(
     String sql, {
     Object? parameters,
     int transaction = 0,
-  }) => _send(_opExecute, sql, parameters, transaction);
+    MysqlCancelToken? cancelToken,
+  }) => _send(_opExecute, sql, parameters, transaction, cancelToken);
+
+  /// Runs [sql] and sends its rows in chunks of up to [chunkSize] rows.
+  /// Each chunk has the same columns and row maps as [query]. The rows are
+  /// read from the server as they come, and Rust reads at most 2 chunks
+  /// ahead of the listener. So a big result does not fill the memory.
+  ///
+  /// The query starts when the stream is listened to. A paused
+  /// subscription stops the reading. Cancel the subscription to stop the
+  /// query: the connection is cleaned up and goes back to the pool. An
+  /// error is a stream error, and then the stream closes.
+  ///
+  /// A stream gets a connection of its own (outside a transaction), so no
+  /// other query waits behind it. Inside a [transaction] it runs on the
+  /// connection of the transaction like any query.
+  ///
+  /// Note: the MySQL server stops a connection whose client does not read
+  /// for `net_write_timeout` seconds (60 by default). So do not pause a
+  /// stream for longer than that.
+  Stream<MysqlNativeResult> stream(
+    String sql, {
+    Object? parameters,
+    int transaction = 0,
+    int chunkSize = 1000,
+    MysqlCancelToken? cancelToken,
+  }) {
+    if (chunkSize < 1) {
+      throw ArgumentError.value(chunkSize, 'chunkSize', 'must be 1 or more');
+    }
+    List<Object?> params;
+    (sql, params) = _params(sql, parameters);
+    return _Link.instance.stream(
+      handle,
+      transaction,
+      sql,
+      params,
+      chunkSize,
+      cancelToken,
+    );
+  }
 
   /// Starts a transaction on one connection. Use its id as `transaction`
   /// of [query], then [commit] or [rollback] it.
@@ -242,19 +316,23 @@ class MysqlNativePool {
     int op,
     String sql,
     Object? parameters,
-    int transaction,
-  ) {
+    int transaction, [
+    MysqlCancelToken? token,
+  ]) {
     List<Object?> params;
+    (sql, params) = _params(sql, parameters);
+    return _Link.instance.send(handle, transaction, op, sql, params, token);
+  }
+
+  static (String, List<Object?>) _params(String sql, Object? parameters) {
     if (parameters is Map<String, dynamic>) {
-      (sql, params) = _toPositional(sql, parameters);
+      return _toPositional(sql, parameters);
     } else if (parameters is List<Object?>) {
-      params = parameters;
+      return (sql, parameters);
     } else if (parameters == null) {
-      params = const <Object?>[];
-    } else {
-      throw ArgumentError.value(parameters, 'parameters', 'a List or a Map');
+      return (sql, const <Object?>[]);
     }
-    return _Link.instance.send(handle, transaction, op, sql, params);
+    throw ArgumentError.value(parameters, 'parameters', 'a List or a Map');
   }
 
   /// changes each known `@key` to `?` and lists its value in the same
@@ -283,6 +361,9 @@ const int _opExecute = 1;
 const int _opBegin = 2;
 const int _opCommit = 3;
 const int _opRollback = 4;
+const int _opStream = 5;
+const int _opCancel = 6;
+const int _opMore = 7;
 
 const int _tNull = 0;
 const int _tInt = 1;
@@ -315,6 +396,50 @@ class MysqlException implements Exception {
     return extra.isEmpty
         ? 'MysqlException: $message'
         : 'MysqlException($extra): $message';
+  }
+}
+
+/// The query was cancelled with a [MysqlCancelToken]. The server may have
+/// run a part of it, or all of it when it ended at the same time.
+class MysqlQueryCancelledException extends MysqlException {
+  MysqlQueryCancelledException()
+    : super('dox_mysql_native: the query was cancelled', sqlState: '70100');
+}
+
+/// Stops queries. Give it as `cancelToken` to [MysqlNativePool.query],
+/// [MysqlNativePool.execute] or [MysqlNativePool.stream], then call
+/// [cancel].
+///
+/// - A query that did not start yet does not run.
+/// - A running query is stopped on the server with `KILL QUERY`, sent on a
+///   new connection. When more queries wait on the same connection, it
+///   runs to its end instead, and its rows are dropped.
+/// - Behind a proxy or load balancer the new connection may reach another
+///   server, so turn the KILL off with `serverKill: false` in
+///   [MysqlNativePool.open]. Then the query fails at once, but runs to its
+///   end on the server. The KILL connection also counts for
+///   `max_user_connections`. A KILL that fails prints a warning on stderr.
+/// - A query that ended already is not changed.
+///
+/// The query then fails with a [MysqlQueryCancelledException]. One token
+/// can stop many queries. After [cancel], new queries with it fail at
+/// once.
+class MysqlCancelToken {
+  bool _cancelled = false;
+
+  /// the ids of the running requests that use this token
+  final Set<int> _ids = <int>{};
+
+  /// true after [cancel]
+  bool get isCancelled => _cancelled;
+
+  /// Stops the queries of this token.
+  void cancel() {
+    if (_cancelled) return;
+    _cancelled = true;
+    for (int id in _ids.toList()) {
+      _Link._instance?._control(_opCancel, id, 0);
+    }
   }
 }
 
@@ -390,25 +515,90 @@ class _Link {
     int tx,
     int op,
     String sql,
+    List<Object?> params, [
+    MysqlCancelToken? token,
+  ]) {
+    if (token != null && token.isCancelled) {
+      return Future<MysqlNativeResult>.error(MysqlQueryCancelledException());
+    }
+    _Pending pending = _Pending(sql, pool, tx, token)
+      ..completer = Completer<MysqlNativeResult>();
+    _start(pending, op, params);
+    return pending.completer!.future;
+  }
+
+  /// Rows in chunks. The request goes when the stream is listened to.
+  Stream<MysqlNativeResult> stream(
+    int pool,
+    int tx,
+    String sql,
     List<Object?> params,
+    int chunkSize,
+    MysqlCancelToken? token,
   ) {
-    int id = _nextId++;
-    _Pending pending = _Pending(sql);
+    _Pending pending = _Pending(sql, pool, tx, token);
+    // sync: a listener that pauses in its handler (eg. `await for`) is
+    // paused right after the add, so no more chunks are asked for
+    StreamController<MysqlNativeResult> controller =
+        StreamController<MysqlNativeResult>(sync: true);
+    pending.controller = controller;
+    controller.onListen = () {
+      if (token != null && token.isCancelled) {
+        controller
+          ..addError(MysqlQueryCancelledException())
+          ..close();
+        return;
+      }
+      _start(pending, _opStream, <Object?>[...params, chunkSize]);
+    };
+    controller.onResume = () {
+      int owed = pending.owed;
+      pending.owed = 0;
+      if (owed > 0 && _pending[pending.id] == pending) {
+        _control(_opMore, pending.id, owed);
+      }
+    };
+    controller.onCancel = () {
+      if (_pending[pending.id] != pending) return;
+      _control(_opCancel, pending.id, 0);
+      _done(pending.id);
+    };
+    return controller.stream;
+  }
+
+  /// Writes the request of [pending] and queues the flush.
+  void _start(_Pending pending, int op, List<Object?> params) {
+    int id = pending.id = _nextId++;
     if (_pending.isEmpty) _port.keepIsolateAlive = true;
     _pending[id] = pending;
     int start = _len;
     try {
-      _write(id, pool, tx, op, sql, params);
+      _write(id, pending.pool, pending.tx, op, pending.sql, params);
     } catch (_) {
       _len = start;
       _done(id);
       rethrow;
     }
+    pending.token?._ids.add(id);
+    _queueFlush();
+  }
+
+  /// A cancel or more record for the request [id] (see lib.rs).
+  void _control(int op, int id, int count) {
+    _Pending? pending = _pending[id];
+    if (pending == null) return;
+    _write(0, pending.pool, pending.tx, op, '', <Object?>[
+      id,
+      if (op == _opMore) count,
+    ]);
+    _queueFlush();
+  }
+
+  void _queueFlush() {
     if (!_flushQueued) {
       _flushQueued = true;
       scheduleMicrotask(_flush);
     }
-    return pending.completer.future;
   }
 
   void _flush() {
@@ -426,7 +616,7 @@ class _Link {
   }
 
   void _done(int id) {
-    _pending.remove(id);
+    _pending.remove(id)?.token?._ids.remove(id);
     if (_pending.isEmpty) _port.keepIsolateAlive = false;
   }
 
@@ -566,12 +756,42 @@ class _Link {
       p = body + len;
       _Pending? pending = _pending[id];
       if (pending == null) continue;
-      _done(id);
-      if (status == 0) {
-        pending.completer.complete(_rows(b, d, body, pending.sql));
-      } else {
-        pending.completer.completeError(_error(b, d, body, len));
+      StreamController<MysqlNativeResult>? controller = pending.controller;
+      if (controller == null) {
+        _done(id);
+        if (status == 0) {
+          pending.completer!.complete(_rows(b, d, body, pending.sql));
+        } else {
+          pending.completer!.completeError(_error(b, d, body, len));
+        }
+        continue;
       }
+      if (status == 1) {
+        _done(id);
+        controller
+          ..addError(_error(b, d, body, len))
+          ..close();
+        continue;
+      }
+      MysqlNativeResult chunk = _rows(b, d, body, pending.sql);
+      if (status == 2) {
+        pending.sent = true;
+        controller.add(chunk);
+        // the listener took it: Rust may read one more chunk. Else ask
+        // when it resumes.
+        if (_pending[id] != pending) continue; // cancelled in the listener
+        if (controller.isPaused) {
+          pending.owed++;
+        } else {
+          _control(_opMore, id, 1);
+        }
+        continue;
+      }
+      _done(id);
+      // the last rows. No empty last chunk, but one result when there was
+      // none (eg. the affected rows of an UPDATE).
+      if (chunk.rows.isNotEmpty || !pending.sent) controller.add(chunk);
+      controller.close();
     }
   }
 
@@ -582,6 +802,7 @@ class _Link {
       Uint8List.sublistView(b, at + 8, at + len),
       allowMalformed: true,
     );
+    if (kind == 2) return MysqlQueryCancelledException();
     if (kind != 0) return MysqlException(message);
     String sqlState = ascii.decode(
       Uint8List.sublistView(b, at + 3, at + 8),
@@ -696,9 +917,24 @@ class _Link {
 }
 
 class _Pending {
-  _Pending(this.sql);
+  _Pending(this.sql, this.pool, this.tx, this.token);
 
   /// the sql of the request, to find the columns it had before
   final String sql;
-  final Completer<MysqlNativeResult> completer = Completer<MysqlNativeResult>();
+  final int pool;
+  final int tx;
+  final MysqlCancelToken? token;
+  int id = 0;
+
+  /// a query or execute
+  Completer<MysqlNativeResult>? completer;
+
+  /// a stream
+  StreamController<MysqlNativeResult>? controller;
+
+  /// a stream: chunks the listener took while paused, to ask for on resume
+  int owed = 0;
+
+  /// a stream: a chunk was sent
+  bool sent = false;
 }

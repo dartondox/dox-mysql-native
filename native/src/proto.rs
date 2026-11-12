@@ -215,6 +215,8 @@ pub(crate) struct Greeting {
     pub nonce: Vec<u8>,
     pub plugin: String,
     pub maria: bool,
+    /// the connection id, for `KILL QUERY`
+    pub thread: u32,
 }
 
 pub(crate) fn greeting(b: &[u8]) -> Result<Greeting, Fail> {
@@ -227,7 +229,8 @@ pub(crate) fn greeting(b: &[u8]) -> Result<Greeting, Fail> {
     }
     let mut p = 1;
     let version = String::from_utf8_lossy(nul_str(b, &mut p)).into_owned();
-    p += 4; // connection id
+    let thread = u32::from_le_bytes(b.get(p..p + 4).ok_or_else(bad)?.try_into().unwrap());
+    p += 4;
     let mut nonce = b.get(p..p + 8).ok_or_else(bad)?.to_vec();
     p += 9; // nonce part 1 and a filler byte
     let lo = u16::from_le_bytes(b.get(p..p + 2).ok_or_else(bad)?.try_into().unwrap());
@@ -258,6 +261,7 @@ pub(crate) fn greeting(b: &[u8]) -> Result<Greeting, Fail> {
         nonce,
         plugin,
         maria: version.contains("MariaDB"),
+        thread,
     })
 }
 
@@ -689,7 +693,7 @@ mod tests {
                 assert_eq!((code, &state), (1146, b"42S02"));
                 assert_eq!(message, "Table 'x' doesn't exist");
             }
-            Fail::Client(_) => panic!(),
+            _ => panic!(),
         }
     }
 
