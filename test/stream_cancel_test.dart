@@ -18,6 +18,7 @@ MysqlNativePool open({
   Duration requestTimeout = const Duration(seconds: 300),
   Duration? maxConnectionAge,
   Duration? idleTimeout,
+  bool serverKill = true,
 }) {
   return MysqlNativePool.open(
     host: host,
@@ -30,6 +31,7 @@ MysqlNativePool open({
     requestTimeout: requestTimeout,
     maxConnectionAge: maxConnectionAge,
     idleTimeout: idleTimeout,
+    serverKill: serverKill,
   );
 }
 
@@ -113,6 +115,43 @@ void main() {
     }
     pool.close();
   }, timeout: const Timeout(Duration(minutes: 2)));
+
+  test('serverKill: false sends no KILL', () async {
+    MysqlNativePool pool = open(
+      cache: 60,
+      max: 2,
+      requestTimeout: const Duration(seconds: 1),
+      serverKill: false,
+    );
+    MysqlNativePool other = open(cache: 61);
+    Future<int> running(String mark) async => (await other.query(
+      'SELECT ID FROM information_schema.PROCESSLIST WHERE INFO LIKE ?',
+      parameters: <Object?>['/* $mark */%'],
+    )).rows.length;
+    // cancel: fails at once, the query goes on on the server
+    MysqlCancelToken token = MysqlCancelToken();
+    Future<MysqlNativeResult> slow = pool.query(
+      '/* mn_nokill_c */ SELECT SLEEP(3)',
+      cancelToken: token,
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    Stopwatch watch = Stopwatch()..start();
+    token.cancel();
+    await expectLater(slow, throwsA(isA<MysqlQueryCancelledException>()));
+    expect(watch.elapsed, lessThan(const Duration(milliseconds: 500)));
+    expect(await running('mn_nokill_c'), 1);
+    // timeout: the socket closes, the query goes on on the server
+    await expectLater(
+      pool.query('/* mn_nokill_t */ SELECT SLEEP(3)'),
+      throwsA(isA<MysqlException>()),
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    expect(await running('mn_nokill_t'), 1);
+    // the pool still works
+    expect((await pool.query('SELECT 1 AS a')).rows.single['a'], 1);
+    pool.close();
+    other.close();
+  });
 
   test('cancel stops a long query on the server', () async {
     MysqlNativePool pool = open(cache: 42, max: 1);

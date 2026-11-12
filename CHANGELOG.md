@@ -3,6 +3,7 @@
 - New pool settings in `MysqlNativePool.open()`. All are optional, and the defaults keep the old behavior:
   - `requestTimeout` (default 300 s): the longest wait for one request. Before, it was fixed at 300 s. URL option `request_timeout_ms`.
 - Fix: a query over its timeout kept running on the server until it ended. Closing the socket does not stop it. Now its server thread gets a `KILL` from a new connection.
+  - `serverKill` (default true, URL option `server_kill`) turns the KILL of a cancel or timeout off. Use it behind a proxy or load balancer, where the new connection may reach another server. A KILL that fails prints a warning on stderr.
   - `maxConnectionAge` (default none): close a connection older than this, once it has no query. URL option `abs_conn_ttl`.
   - `idleTimeout` (default 12 hours): close a connection with no traffic for this long, once it has no query. URL option `conn_ttl`.
 - Fix: `maxConnectionAge` was used as the idle time (no traffic) of a connection, not its age. Now it is the age, like its name says, and `idleTimeout` is the idle time. Its type is now `Duration?`. Old code that passes a `Duration` still compiles.

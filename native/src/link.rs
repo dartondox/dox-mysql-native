@@ -526,6 +526,10 @@ pub(crate) struct Conn {
     doomed: bool,
     /// a kill connection (not counted in the pool)
     kill: Option<Kill>,
+    /// the key of a kill connection that runs for this one: new commands
+    /// wait until it has its answer, so the KILL can only hit the query it
+    /// is for
+    hold: Option<usize>,
 }
 
 /// The addresses of a host (a blocking DNS lookup: only when a pool opens,
@@ -636,6 +640,7 @@ impl Conn {
             thread: 0,
             doomed: false,
             kill: None,
+            hold: None,
         })
     }
 
@@ -685,7 +690,10 @@ impl Conn {
     /// Sends a command, or holds it until it can go. A PREPARE may pass
     /// the held commands: it changes nothing the others see.
     fn put(&mut self, cmd: Cmd, ready: &mut Vec<u8>) {
-        if self.ready() && (self.held.is_empty() || matches!(cmd, Cmd::Prepare(..))) {
+        if self.ready()
+            && self.hold.is_none()
+            && (self.held.is_empty() || matches!(cmd, Cmd::Prepare(..)))
+        {
             if let Some(cmd) = self.encode(cmd, ready) {
                 self.held.push_back(cmd);
             }
@@ -747,6 +755,9 @@ impl Conn {
 
     /// Sends the held commands that can go now, in order.
     fn release_held(&mut self, ready: &mut Vec<u8>) {
+        if self.hold.is_some() {
+            return;
+        }
         while let Some(cmd) = self.held.pop_front() {
             if let Some(cmd) = self.encode(cmd, ready) {
                 self.held.push_front(cmd);
@@ -1301,7 +1312,12 @@ impl Conn {
                 }
             }
             What::Silent => self.ending = false,
-            What::Prepare(_) | What::Reset | What::Kill => {}
+            // 1094: unknown thread, the query or connection ended already
+            What::Kill => match w.fail {
+                Some(Fail::Server { code: 1094, .. }) | None => {}
+                Some(f) => kill_failed(&f),
+            },
+            What::Prepare(_) | What::Reset => {}
         }
     }
 
@@ -1365,6 +1381,20 @@ fn room(b: &mut Vec<u8>, s: &mut usize, e: &mut usize, min: usize) {
         let size = (b.len() * 2).max(*e + min).max(READ_ROOM * 4);
         b.resize(size, 0);
     }
+}
+
+/// A KILL that did not work: the query may still run on the server. Said
+/// on stderr, as there is no one to give the error to.
+fn kill_failed(f: &Fail) {
+    let why = match f {
+        Fail::Server { code, message, .. } => format!("{message} (code {code})"),
+        Fail::Client(m) => m.clone(),
+        Fail::Cancelled => return,
+    };
+    eprintln!(
+        "dox_mysql_native: warning: KILL of a cancelled or timed out query failed, \
+         it may still run on the server: {why}"
+    );
 }
 
 /// Sends the rows of a stream so far to Dart as a chunk record (status 2),
@@ -1751,6 +1781,12 @@ impl Core {
             let w = &mut c.waits[i];
             if op == OP_CANCEL {
                 w.cancel = true;
+                if !c.shared.opts.server_kill && matches!(w.what, What::Result { .. }) {
+                    // no KILL: Dart gets the error now, and the query runs
+                    // to its end with its rows dropped (its id is gone)
+                    push(&mut self.ready, record(w.id, Err(Fail::Cancelled)));
+                    w.id = 0;
+                }
             } else {
                 w.credit = w.credit.saturating_add(n);
                 // progress: Dart takes the chunks
@@ -1814,6 +1850,7 @@ impl Core {
                     close.push(k);
                 }
             } else if now >= kill.until {
+                kill_failed(&Fail::client("no answer in time"));
                 close.push(k);
             } else if c.ready() {
                 send.push(k);
@@ -1827,10 +1864,11 @@ impl Core {
             // the request still runs, alone: else KILL could hit the next
             // command (in a transaction, more commands can come after the
             // kill started). Then it drains.
+            // (new commands are held while the kill runs, see `hold`)
             let runs = target.is_none_or(|(target, id)| {
                 self.conns
                     .get(target)
-                    .is_some_and(|t| t.waits.len() == 1 && t.held.is_empty() && t.waits[0].id == id)
+                    .is_some_and(|t| t.waits.len() == 1 && t.waits[0].id == id)
             });
             if !runs {
                 close.push(k);
@@ -1853,7 +1891,7 @@ impl Core {
         let mut start = Vec::new();
         for (k, c) in self.conns.iter_mut() {
             let alone = c.waits.len() == 1 && c.held.is_empty();
-            if c.kill.is_some() || c.thread == 0 || !alone {
+            if c.kill.is_some() || c.thread == 0 || !alone || !c.shared.opts.server_kill {
                 continue;
             }
             let w = &mut c.waits[0];
@@ -1866,19 +1904,30 @@ impl Core {
             }
         }
         for (target, id, thread, shared) in start {
-            self.start_kill(shared, thread, Some((target, id)));
+            let kill = self.start_kill(shared, thread, Some((target, id)));
+            self.conns[target].hold = kill;
         }
     }
 
     /// Opens a kill connection for server thread `thread` (see [Kill]).
     /// When it can not connect, nothing is killed: a cancelled request
     /// drains.
-    fn start_kill(&mut self, shared: Arc<Shared>, thread: u32, target: Option<(usize, u64)>) {
+    /// Returns its key.
+    fn start_kill(
+        &mut self,
+        shared: Arc<Shared>,
+        thread: u32,
+        target: Option<(usize, u64)>,
+    ) -> Option<usize> {
         let now = self.now;
         let until = now + shared.opts.timeout;
         {
-            let Ok(mut c) = Conn::start(shared, now) else {
-                return;
+            let mut c = match Conn::start(shared, now) {
+                Ok(c) => c,
+                Err(f) => {
+                    kill_failed(&f);
+                    return None;
+                }
             };
             c.kill = Some(Kill {
                 target,
@@ -1894,8 +1943,11 @@ impl Core {
                 .register(c.sock.source(), Token(entry.key()), i)
                 .is_ok()
             {
+                let key = entry.key();
                 entry.insert(c);
+                return Some(key);
             }
+            None
         }
     }
 
@@ -2189,6 +2241,19 @@ impl Core {
         if c.waits.iter().any(|w| w.ddl) {
             c.shared.schema.fetch_add(1, Ordering::Relaxed);
         }
+        if let Some(kill) = &c.kill {
+            if let Some(f) = &why {
+                kill_failed(f);
+            }
+            // the target may take new commands again
+            if let Some((t, _)) = kill.target
+                && let Some(t) = self.conns.get_mut(t)
+                && t.hold == Some(key)
+            {
+                t.hold = None;
+                t.release_held(&mut self.ready);
+            }
+        }
         if let Some(f) = why {
             c.fail_all(&f, &mut self.ready);
         }
@@ -2416,7 +2481,8 @@ impl Core {
             let t = c.shared.opts.timeout;
             // closing the socket does not stop the query: the server only
             // sees it when it writes. So kill its server thread.
-            if c.kill.is_none() && c.thread != 0 && !c.waits.is_empty() {
+            if c.kill.is_none() && c.thread != 0 && !c.waits.is_empty() && c.shared.opts.server_kill
+            {
                 let (shared, thread) = (c.shared.clone(), c.thread);
                 self.start_kill(shared, thread, None);
                 // wake to give up on it, if it can not log in

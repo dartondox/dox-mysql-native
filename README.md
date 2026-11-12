@@ -70,7 +70,11 @@ All are optional. The defaults keep the old behavior.
 - `maxConnectionAge` (default none): close a connection older than this, once it has no query.
 - `idleTimeout` (default 12 hours): close a connection with no traffic for this long, once it has no query.
 
+- `serverKill` (default true): stop a cancelled or timed out query on the server, with `KILL QUERY` or `KILL` sent on a new connection. URL option `server_kill`.
+
 A connection that runs a query is never closed by these.
+
+The KILL goes on a new connection. Behind a proxy or load balancer (eg. ProxySQL, or a cloud endpoint over many servers), that connection may reach another server, and the KILL may hit another session. Set `serverKill: false` there. Then a cancelled query fails at once in Dart but runs to its end on the server, and a timed out query only has its socket closed. The KILL connection also counts for `max_user_connections`. A KILL that fails (eg. no free connection) prints a warning on stderr.
 
 ### Cancel a query
 
@@ -81,7 +85,8 @@ token.cancel(); // slow fails with MysqlQueryCancelledException
 ```
 
 - `query`, `execute` and `stream` take `cancelToken`.
-- Not started yet: it does not run. Running: the driver sends `KILL QUERY` on a new connection, so the server stops it. Ended already: nothing changes.
+- Not started yet: it does not run. Running: the driver sends `KILL QUERY` on a new connection, so the server stops it (see `serverKill` above). Ended already: nothing changes.
+- In a transaction, the next queries wait until the KILL has its answer, so it can only stop the cancelled query.
 - When more queries wait on the same connection, the cancelled one runs to its end instead, and its rows are dropped. A late `KILL QUERY` could stop the next query, so it is not sent then.
 - A connection that got a `KILL QUERY` takes no new query, and closes once it has none. Inside a transaction it stays, and the transaction goes on.
 
@@ -135,6 +140,7 @@ If the app still opens a pool, it throws an error that says the library is not i
 `MysqlNativePool.fromUrl()` takes the URL options that mysql_async took, so old URLs still work.
 
 These work like before: `pool_max`, `pool_min`, `stmt_cache_size`, `conn_ttl` (close a connection with no traffic for this many seconds), `wait_timeout` (the same, when `conn_ttl` is not set), `inactive_connection_ttl` (close idle connections over `pool_min`), `abs_conn_ttl` and `abs_conn_ttl_jitter` (close a connection after this age, once it has no query), `reset_connection` (on by default: reset the session when a connection has no query left), `tcp_keepalive` (milliseconds), `socket`, `require_ssl`, `verify_ca`, `verify_identity`, `built_in_roots`, `client_found_rows`, `tcp_nodelay` and `enable_cleartext_plugin`.
+`server_kill` is new: `serverKill` (true by default).
 `request_timeout_ms` is new: `requestTimeout` in milliseconds (300000 by default).
 `ssl_ca` is new: the path of a PEM file with more CA certificates to trust, eg. a private CA. The Mozilla roots stay trusted, unless `built_in_roots=false`. In `MysqlNativePool.open()` it is `sslRootCert`.
 `MysqlNativePool.open()` sets `reset_connection=false`, so the prepared statements stay.

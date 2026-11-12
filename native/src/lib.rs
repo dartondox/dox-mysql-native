@@ -193,6 +193,9 @@ struct Opts {
     cleartext: bool,
     /// the longest wait for one request (`request_timeout_ms`)
     timeout: Duration,
+    /// stop a cancelled or timed out query on the server, with KILL on a
+    /// new connection (`server_kill`)
+    server_kill: bool,
 }
 
 const BAD_URL: &str = "not a mysql:// URL, or an unknown option or a bad option value";
@@ -240,6 +243,7 @@ fn parse_url(text: &str) -> Option<Opts> {
         nodelay: true,
         cleartext: false,
         timeout: TIMEOUT,
+        server_kill: true,
     };
     let mut wait_timeout = None;
     let mut tls = TlsOpts {
@@ -272,6 +276,7 @@ fn parse_url(text: &str) -> Option<Opts> {
             "abs_conn_ttl_jitter" => o.abs_jitter = Some(Duration::from_secs(num()?)),
             "inactive_connection_ttl" => o.inactive_ttl = Duration::from_secs(num()?),
             "tcp_keepalive" => o.keepalive = Some(Duration::from_millis(num()?)),
+            "server_kill" => o.server_kill = flag()?,
             "request_timeout_ms" => o.timeout = Duration::from_millis(num()?.max(1)),
             // known to mysql_async, not used here (see README.md)
             "prefer_socket" | "secure_auth" => {
@@ -934,6 +939,12 @@ mod tests {
         assert_eq!(o.timeout, TIMEOUT);
         let o = parse_url("mysql://u@h/d?request_timeout_ms=1500").unwrap();
         assert_eq!(o.timeout, Duration::from_millis(1500));
+        assert!(o.server_kill);
+        assert!(
+            !parse_url("mysql://u@h/d?server_kill=false")
+                .unwrap()
+                .server_kill
+        );
         assert!(o.reset);
         let o = parse_url("mysql://root@localhost/db?socket=/tmp/my.sock").unwrap();
         assert_eq!(o.socket.as_deref(), Some("/tmp/my.sock"));

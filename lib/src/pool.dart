@@ -85,10 +85,19 @@ class MysqlNativePool {
   ///
   /// [requestTimeout] is the longest wait for one request: a free
   /// connection, the connect and the query. Over it the request fails
-  /// with a [MysqlException]. A query that timed out closes its connection
-  /// (the server may still finish it). A transaction with no request for
-  /// this long is rolled back. For a [stream], the time counts from the
-  /// last chunk.
+  /// with a [MysqlException], and its connection is closed. With
+  /// [serverKill] on, a `KILL` on a new connection also stops the query on
+  /// the server. A transaction with no request for this long is rolled
+  /// back. For a [stream], the time counts from the last chunk.
+  ///
+  /// [serverKill] (default true): a cancelled or timed out query is
+  /// stopped on the server with `KILL QUERY` or `KILL`, sent on a new
+  /// connection. Turn it off when the database is behind a proxy or load
+  /// balancer: the new connection may reach another server, and then the
+  /// KILL may hit another session. Off: a cancelled query runs to its end
+  /// on the server and only its result is dropped, and a timed out query
+  /// only has its socket closed. The new connection also counts for
+  /// `max_user_connections`. A KILL that fails prints a warning on stderr.
   ///
   /// [maxConnectionAge] closes a connection that is older than this, once
   /// it has no query (so a connection in use is never closed). null: no
@@ -114,6 +123,7 @@ class MysqlNativePool {
     Duration requestTimeout = const Duration(seconds: 300),
     Duration? maxConnectionAge,
     Duration? idleTimeout,
+    bool serverKill = true,
     int threads = 1,
   }) {
     bool socket = host.startsWith('/');
@@ -136,6 +146,7 @@ class MysqlNativePool {
         if (maxConnectionAge != null)
           'abs_conn_ttl': '${maxConnectionAge.inSeconds}',
         'request_timeout_ms': '${requestTimeout.inMilliseconds}',
+        if (!serverKill) 'server_kill': 'false',
         if (secure) 'require_ssl': 'true',
         // sent also without TLS, so fromUrl() can warn that it is ignored
         'ssl_ca': ?sslRootCert,
@@ -403,6 +414,11 @@ class MysqlQueryCancelledException extends MysqlException {
 /// - A running query is stopped on the server with `KILL QUERY`, sent on a
 ///   new connection. When more queries wait on the same connection, it
 ///   runs to its end instead, and its rows are dropped.
+/// - Behind a proxy or load balancer the new connection may reach another
+///   server, so turn the KILL off with `serverKill: false` in
+///   [MysqlNativePool.open]. Then the query fails at once, but runs to its
+///   end on the server. The KILL connection also counts for
+///   `max_user_connections`. A KILL that fails prints a warning on stderr.
 /// - A query that ended already is not changed.
 ///
 /// The query then fails with a [MysqlQueryCancelledException]. One token
