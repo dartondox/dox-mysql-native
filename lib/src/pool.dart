@@ -819,9 +819,13 @@ class _Link {
   /// stream is stopped on the Rust side too, so its connection is free.
   void _bad(_Pending pending, int id, int status, Object e) {
     MysqlException error = MysqlException('bad result: $e');
-    bool open = _pending[id] == pending;
-    _done(id);
     StreamController<MysqlNativeResult>? controller = pending.controller;
+    // a chunk (status 2): more may come, so stop the query. Before
+    // `_done`, as in `onCancel`: `_control` needs the pending request.
+    if (controller != null && status == 2 && _pending[id] == pending) {
+      _control(_opCancel, id, 0);
+    }
+    _done(id);
     if (controller == null) {
       if (!pending.completer!.isCompleted) {
         pending.completer!.completeError(error);
@@ -833,8 +837,6 @@ class _Link {
         ..addError(error)
         ..close();
     }
-    // a chunk (status 2): more may come, so stop the query
-    if (open && status == 2) _control(_opCancel, id, 0);
   }
 
   static MysqlException _error(Uint8List b, ByteData d, int at, int len) {
@@ -994,4 +996,11 @@ class _Pending {
 
   /// a stream: a chunk was sent
   bool sent = false;
+}
+
+/// For tests only (not exported by the package): the next result of [sql]
+/// with these column bytes (u16 length and name, for each column) can not be
+/// read, so its record goes to `_Link._bad`.
+void debugPoisonColumns(String sql, List<int> bytes) {
+  _Link._columns[sql] = (Uint8List.fromList(bytes), const <String>[]);
 }

@@ -2,4 +2,4 @@
 /// default MySQL driver.
 library;
 
-export 'src/pool.dart';
+export 'src/pool.dart' hide debugPoisonColumns;

@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:dox_mysql_native/dox_mysql_native.dart';
+import 'package:dox_mysql_native/src/pool.dart' show debugPoisonColumns;
 import 'package:test/test.dart';
 
 /// A tiny server that needs no database: it accepts any login and answers
@@ -39,7 +40,10 @@ List<int> _column(String name, int type) => <int>[
 
 /// Starts the server. [rows] are the packets after the column count and
 /// the column definitions.
-Future<ServerSocket> _serve(List<List<int>> Function() rows) async {
+Future<ServerSocket> _serve(
+  List<List<int>> Function() rows, {
+  List<String>? queries,
+}) async {
   ServerSocket server = await ServerSocket.bind(
     InternetAddress.loopbackIPv4,
     0,
@@ -80,6 +84,8 @@ Future<ServerSocket> _serve(List<List<int>> Function() rows) async {
           s.add(_packet(2, ok));
         } else if (payload[0] == 0x03) {
           // COM_QUERY: one column of text and one of JSON
+          String sql = String.fromCharCodes(payload.sublist(1));
+          queries?.add(sql);
           int seq = 1;
           s.add(_packet(seq++, <int>[2]));
           s.add(_packet(seq++, _column('t', 253)));
@@ -87,7 +93,10 @@ Future<ServerSocket> _serve(List<List<int>> Function() rows) async {
           for (List<int> row in rows()) {
             s.add(_packet(seq++, row));
           }
-          s.add(_packet(seq++, <int>[0xFE, 0, 0, 2, 0, 0, 0]));
+          // a query with HOLD never ends, like a long query
+          if (!sql.contains('HOLD')) {
+            s.add(_packet(seq++, <int>[0xFE, 0, 0, 2, 0, 0, 0]));
+          }
         } else if (payload[0] == 0x1f) {
           s.add(_packet(1, ok)); // COM_RESET_CONNECTION
         } else if (payload[0] == 0x01) {
@@ -132,4 +141,72 @@ void main() {
       await server.close();
     },
   );
+
+  group('a record Dart can not read', () {
+    // the column bytes of the result of _serve (t and j), with no names
+    // behind them, so the rows can not be read
+    const List<int> columnBytes = <int>[1, 0, 0x74, 1, 0, 0x6a];
+    List<List<int>> rows() => <List<int>>[
+      for (int i = 0; i < 4; i++)
+        <int>[..._str('x'.codeUnits), ..._str('{}'.codeUnits)],
+    ];
+
+    test('fails only that request, and the pool still works', () async {
+      ServerSocket server = await _serve(rows);
+      MysqlNativePool pool = MysqlNativePool.fromUrl(
+        'mysql://u:pw@127.0.0.1:${server.port}/db',
+      );
+      debugPoisonColumns('SELECT 1', columnBytes);
+      await expectLater(
+        pool.query('SELECT 1').timeout(const Duration(seconds: 10)),
+        throwsA(
+          isA<MysqlException>().having(
+            (MysqlException e) => e.message,
+            'message',
+            startsWith('bad result:'),
+          ),
+        ),
+      );
+      MysqlNativeResult r = await pool
+          .query('SELECT 2')
+          .timeout(const Duration(seconds: 10));
+      expect(r.rows, hasLength(4));
+      pool.close();
+      await server.close();
+    });
+
+    test('a stream gets the error, closes and is cancelled', () async {
+      List<String> queries = <String>[];
+      ServerSocket server = await _serve(rows, queries: queries);
+      MysqlNativePool pool = MysqlNativePool.fromUrl(
+        'mysql://u:pw@127.0.0.1:${server.port}/db',
+      );
+      debugPoisonColumns('SELECT 3 /* HOLD */', columnBytes);
+      List<Object> events = <Object>[];
+      await pool
+          .stream('SELECT 3 /* HOLD */', chunkSize: 1)
+          .map<Object>((MysqlNativeResult r) => r)
+          .handleError((Object e) => events.add(e))
+          .toList()
+          .timeout(const Duration(seconds: 10));
+      expect(events.single, isA<MysqlException>());
+      expect(
+        (events.single as MysqlException).message,
+        startsWith('bad result:'),
+      );
+      // the cancel reached Rust: it stops the query on the server with
+      // KILL QUERY (the id of the connection in the greeting is 7)
+      for (int i = 0; i < 100 && !queries.contains('KILL QUERY 7'); i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      }
+      expect(queries, contains('KILL QUERY 7'));
+      // the pool gives a connection again
+      MysqlNativeResult r = await pool
+          .query('SELECT 4')
+          .timeout(const Duration(seconds: 10));
+      expect(r.rows, hasLength(4));
+      pool.close();
+      await server.close();
+    });
+  });
 }
