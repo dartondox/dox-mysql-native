@@ -1,5 +1,13 @@
 ## Unreleased
 
+- New pool settings in `MysqlNativePool.open()`. All are optional, and the defaults keep the old behavior:
+  - `requestTimeout` (default 300 s): the longest wait for one request. Before, it was fixed at 300 s. URL option `request_timeout_ms`.
+  - `maxConnectionAge` (default none): close a connection older than this, once it has no query. URL option `abs_conn_ttl`.
+  - `idleTimeout` (default 12 hours): close a connection with no traffic for this long, once it has no query. URL option `conn_ttl`.
+- Fix: `maxConnectionAge` was used as the idle time (no traffic) of a connection, not its age. Now it is the age, like its name says, and `idleTimeout` is the idle time. Its type is now `Duration?`. Old code that passes a `Duration` still compiles.
+- New `MysqlCancelToken`. `query`, `execute` and `stream` take `cancelToken:`. `cancel()` stops the query: one that did not start does not run, a running one is stopped on the server with `KILL QUERY`. The query then fails with the new `MysqlQueryCancelledException` (a `MysqlException`). A connection that got a `KILL QUERY` closes once it has no query, so the pool stays clean.
+- New `stream()`: the rows of a query in chunks of `chunkSize` rows (1000 by default). Rows are read from the server as they come, and Rust reads at most 2 chunks ahead of the listener, so a big result does not fill the memory. Cancelling the subscription stops the query. Works inside a transaction.
+- The FFI record layout has new ops and a new status. The native ABI version goes up at the next release.
 - Requires Dart 3.14 or newer.
 - Fix: `--` with no space after it is not a comment in MySQL, and is no longer read as one when a schema change is looked for.
 - Fix: a schema change in a multi-statement query (eg. `SELECT 1; ALTER TABLE t ...`) is now seen, so the statements are prepared again.

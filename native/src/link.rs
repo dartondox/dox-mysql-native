@@ -74,9 +74,9 @@ use slab::Slab;
 
 use crate::proto::{self, Column};
 use crate::{
-    Fail, OP_BEGIN, OP_COMMIT, OP_EXECUTE, OP_QUERY, OP_ROLLBACK, POOL_CLOSED, POST, Param,
-    RES_HEAD, Reader, Request, Shared, TIMED_OUT, TIMEOUT, ok_head, pool_of, post, read_request,
-    record,
+    CREDIT, Fail, OP_BEGIN, OP_CANCEL, OP_COMMIT, OP_EXECUTE, OP_MORE, OP_QUERY, OP_ROLLBACK,
+    OP_STREAM, POOL_CLOSED, POST, Param, RES_HEAD, Reader, Request, Shared, ok_head, pool_of, post,
+    read_request, record, timed_out,
 };
 
 const WAKER: Token = Token(usize::MAX);
@@ -241,6 +241,8 @@ enum What {
     Prepare(usize),
     /// COM_RESET_CONNECTION: nobody waits, an error is ignored
     Reset,
+    /// KILL QUERY on a kill connection: nobody waits, an error is ignored
+    Kill,
 }
 
 /// Where the answer of a command is.
@@ -268,6 +270,18 @@ struct Wait {
     /// a CREATE, ALTER, DROP or RENAME: the pool counts a schema change
     /// again when it is done
     ddl: bool,
+    /// Dart cancelled it: its rows are dropped, and it ends with a
+    /// cancelled error
+    cancel: bool,
+    /// a KILL QUERY for it was started
+    killing: bool,
+    /// a stream: the rows go to Dart in chunks of this many. 0: no stream.
+    chunk: u32,
+    /// a stream: how many more chunks Dart takes now. At 0 the connection
+    /// stops reading.
+    credit: u32,
+    /// where the rows start in `out` (after the column names)
+    head_len: usize,
 }
 
 impl Wait {
@@ -287,8 +301,47 @@ impl Wait {
             count: 0,
             fail: None,
             ddl: false,
+            cancel: false,
+            killing: false,
+            chunk: 0,
+            credit: 0,
+            head_len: 0,
         }
     }
+
+    /// The wait of a query, execute or stream request. A stream request
+    /// has its chunk size as the last param.
+    fn of(req: &mut Request, deadline: Instant) -> Wait {
+        let chunk = if req.op == OP_STREAM {
+            match req.params.pop() {
+                Some(Param::Int(n)) => n.clamp(1, i64::from(u32::MAX)) as u32,
+                _ => 1000,
+            }
+        } else {
+            0
+        };
+        let what = What::Result {
+            rows: req.op != OP_EXECUTE,
+            binary: !req.params.is_empty(),
+        };
+        let mut w = Wait::new(req.id, what, deadline);
+        w.chunk = chunk;
+        w.credit = CREDIT;
+        w
+    }
+}
+
+/// A kill connection: it only sends `KILL QUERY` for a cancelled request.
+struct Kill {
+    /// the connection (key) and the request (id) to stop
+    target: usize,
+    id: u64,
+    /// the connection id on the server
+    thread: u32,
+    /// KILL QUERY is sent
+    sent: bool,
+    /// give up when it is not sent by then
+    until: Instant,
 }
 
 /// A command that is not sent yet: the connection logs in, or a command
@@ -464,6 +517,13 @@ pub(crate) struct Conn {
     ending: bool,
     /// give it back once it has no command: no new command goes to it
     release: bool,
+    /// the connection id on the server, for KILL QUERY
+    thread: u32,
+    /// a KILL QUERY was sent for it: no new command goes to it, and it
+    /// closes once it has no command
+    doomed: bool,
+    /// a kill connection (not counted in the pool)
+    kill: Option<Kill>,
 }
 
 /// The addresses of a host (a blocking DNS lookup: only when a pool opens,
@@ -571,6 +631,9 @@ impl Conn {
             tx: None,
             ending: false,
             release: false,
+            thread: 0,
+            doomed: false,
+            kill: None,
         })
     }
 
@@ -585,7 +648,14 @@ impl Conn {
 
     /// free for new commands of any request (not a transaction's)
     fn free(&self) -> bool {
-        self.tx.is_none() && !self.ending && !self.release
+        self.tx.is_none() && !self.ending && !self.release && !self.doomed
+    }
+
+    /// a stream at the front waits for Dart to take its chunks: do not read
+    fn paused(&self) -> bool {
+        self.waits
+            .front()
+            .is_some_and(|w| w.chunk > 0 && w.credit == 0 && !w.cancel)
     }
 
     /// free and with no command: can be given away or closed
@@ -896,7 +966,9 @@ impl Conn {
         let inb = std::mem::take(&mut self.inb);
         let mut p = self.in_s;
         let mut res = Ok(());
-        while let Some((payload, seq, used)) = proto::next_packet(&inb[p..self.in_e]) {
+        while !self.paused()
+            && let Some((payload, seq, used)) = proto::next_packet(&inb[p..self.in_e])
+        {
             p += used;
             self.seq = seq;
             res = if self.ready() {
@@ -938,6 +1010,7 @@ impl Conn {
             Phase::Greeting => {
                 let g = proto::greeting(b)?;
                 self.maria = g.maria;
+                self.thread = g.thread;
                 let mut caps = CAPS;
                 if o.db.is_some() {
                     caps |= proto::CONNECT_WITH_DB;
@@ -1121,6 +1194,7 @@ impl Conn {
                         w.out[at..at + 4].copy_from_slice(&(n as u32).to_le_bytes());
                     }
                     w.st = if n == 0 { St::Rows } else { St::Cols(n) };
+                    w.head_len = w.out.len();
                 }
             },
             St::Cols(left) => {
@@ -1135,6 +1209,7 @@ impl Conn {
                         w.out.extend_from_slice(&c.name);
                     }
                     w.cols.push(c);
+                    w.head_len = w.out.len();
                 }
                 w.st = if left == 1 {
                     St::Rows
@@ -1157,7 +1232,7 @@ impl Conn {
                     } else {
                         w.st = St::Head;
                     }
-                } else if w.first && rows {
+                } else if w.first && rows && !w.cancel {
                     let ok = if binary {
                         proto::binary_row(&mut w.out, b, &w.cols)
                     } else {
@@ -1165,6 +1240,10 @@ impl Conn {
                     };
                     ok.ok_or_else(bad)?;
                     w.count += 1;
+                    if w.count == w.chunk {
+                        w.deadline = now + self.shared.opts.timeout;
+                        chunk(w, ready);
+                    }
                 }
             }
             St::Skip(_) => finished = true,
@@ -1187,6 +1266,7 @@ impl Conn {
                     self.used = now;
                 }
                 let r = match w.fail {
+                    _ if w.cancel => Err(Fail::Cancelled),
                     Some(f) => Err(f),
                     None => {
                         let at = RES_HEAD + 20;
@@ -1219,7 +1299,7 @@ impl Conn {
                 }
             }
             What::Silent => self.ending = false,
-            What::Prepare(_) | What::Reset => {}
+            What::Prepare(_) | What::Reset | What::Kill => {}
         }
     }
 
@@ -1231,7 +1311,7 @@ impl Conn {
         self.dirty = false;
         self.stmts.clear();
         self.cache.clear();
-        self.put(Cmd::Reset(now + TIMEOUT), ready);
+        self.put(Cmd::Reset(now + self.shared.opts.timeout), ready);
     }
 
     /// A ROLLBACK nobody waits for. The connection is free after it.
@@ -1241,7 +1321,7 @@ impl Conn {
         }
         self.tx = None;
         self.ending = true;
-        let w = Wait::new(0, What::Silent, now + TIMEOUT);
+        let w = Wait::new(0, What::Silent, now + self.shared.opts.timeout);
         self.put(Cmd::Query(w, "ROLLBACK".into()), ready);
     }
 
@@ -1283,6 +1363,21 @@ fn room(b: &mut Vec<u8>, s: &mut usize, e: &mut usize, min: usize) {
         let size = (b.len() * 2).max(*e + min).max(READ_ROOM * 4);
         b.resize(size, 0);
     }
+}
+
+/// Sends the rows of a stream so far to Dart as a chunk record (status 2),
+/// and starts the next chunk with the same column names.
+fn chunk(w: &mut Wait, ready: &mut Vec<u8>) {
+    let mut next = Vec::with_capacity(w.out.len());
+    next.extend_from_slice(&w.out[..w.head_len]);
+    let mut out = std::mem::replace(&mut w.out, next);
+    let at = RES_HEAD + 20;
+    out[at..at + 4].copy_from_slice(&w.count.to_le_bytes());
+    let mut rec = record(w.id, Ok(out));
+    rec[8] = 2;
+    push(ready, rec);
+    w.count = 0;
+    w.credit = w.credit.saturating_sub(1);
 }
 
 /// Writes affected rows and insert id into an ok record (not for a
@@ -1587,12 +1682,15 @@ impl Core {
             l.full = false;
             l.failed = None;
         }
-        let deadline = self.now + TIMEOUT;
         let mut seen = Vec::new();
         let mut r = Reader(b);
         while let Some(req) = read_request(&mut r) {
+            if req.op == OP_CANCEL || req.op == OP_MORE {
+                self.control(req);
+                continue;
+            }
             if req.tx != 0 {
-                self.in_tx(req, deadline);
+                self.in_tx(req);
                 continue;
             }
             if req.op == OP_COMMIT || req.op == OP_ROLLBACK {
@@ -1603,6 +1701,7 @@ impl Core {
                 self.fail(req.id, Fail::client(POOL_CLOSED));
                 continue;
             };
+            let deadline = self.now + self.pools[&pid].shared.opts.timeout;
             if let Err(req) = self.place(pid, req, deadline) {
                 self.pools
                     .get_mut(&pid)
@@ -1615,15 +1714,181 @@ impl Core {
         for pid in ids {
             self.balance(pid);
         }
+        self.kills();
         self.timers();
         self.flush_all();
         self.route();
     }
 
+    /// A cancel or more record from Dart (its params: the id of the
+    /// request, and for more a count). A request of another isolate's
+    /// transaction: the record goes there too.
+    fn control(&mut self, req: Request) {
+        let Some(Param::Int(id)) = req.params.first() else {
+            return;
+        };
+        let n = match req.params.get(1) {
+            Some(Param::Int(n)) => (*n).clamp(0, i64::from(u32::MAX)) as u32,
+            _ => 0,
+        };
+        if !self.control_here(req.op, *id as u64, n) && req.tx != 0 {
+            self.forward(req);
+        }
+    }
+
+    /// Cancels request `id` (op cancel), or lets its stream read `n` more
+    /// chunks (op more). false: it is not in this link.
+    fn control_here(&mut self, op: u8, id: u64, n: u32) -> bool {
+        let found = self.conns.iter().find_map(|(k, c)| {
+            let at = c.waits.iter().position(|w| w.id == id);
+            at.map(|i| (k, i))
+        });
+        if let Some((k, i)) = found {
+            let c = &mut self.conns[k];
+            let timeout = c.shared.opts.timeout;
+            let w = &mut c.waits[i];
+            if op == OP_CANCEL {
+                w.cancel = true;
+            } else {
+                w.credit = w.credit.saturating_add(n);
+                // progress: Dart takes the chunks
+                w.deadline = self.now + timeout;
+            }
+            if i == 0 {
+                // read on: a paused stream may go again. As if the socket
+                // was closed, so it reads to WouldBlock (the edge is gone).
+                self.event(k, true, false, true);
+            }
+            return true;
+        }
+        if op != OP_CANCEL {
+            return false;
+        }
+        for l in self.pools.values_mut() {
+            if let Some(i) = l.queue.iter().position(|q| q.req.id == id) {
+                l.queue.remove(i);
+                self.fail(id, Fail::Cancelled);
+                return true;
+            }
+        }
+        for (_, c) in self.conns.iter_mut() {
+            let Some(i) = c
+                .held
+                .iter()
+                .position(|cmd| matches!(cmd, Cmd::Query(w, _) | Cmd::Exec(w, ..) if w.id == id))
+            else {
+                continue;
+            };
+            if let Some(Cmd::Exec(_, slot, _)) = c.held.remove(i) {
+                let st = &mut c.stmts[slot];
+                st.refs -= 1;
+                if st.refs == 0 && st.failed.is_some() {
+                    c.stmts.remove(slot);
+                }
+            }
+            push(&mut self.ready, record(id, Err(Fail::Cancelled)));
+            return true;
+        }
+        false
+    }
+
+    /// Stops cancelled requests that run on the server, with `KILL QUERY`
+    /// on a new connection (the server stops the query; the connection
+    /// stays fine). Only when the request is alone on its connection:
+    /// with a pipelined command behind it, a late KILL could stop that
+    /// one instead. Then it drains: it runs to its end, its rows are
+    /// dropped, and Dart gets the cancelled error.
+    /// A pool connection that got a KILL takes no new command and closes
+    /// once it has none, so no killed state can stay on it.
+    // ponytail: one new connection per kill. Cancels are rare.
+    fn kills(&mut self) {
+        let now = self.now;
+        let mut close = Vec::new();
+        let mut send = Vec::new();
+        for (k, c) in self.conns.iter() {
+            let Some(kill) = &c.kill else { continue };
+            if kill.sent {
+                if c.load() == 0 {
+                    close.push(k);
+                }
+            } else if now >= kill.until {
+                close.push(k);
+            } else if c.ready() {
+                send.push(k);
+            }
+        }
+        for k in send {
+            let Some(kill) = &self.conns[k].kill else {
+                continue;
+            };
+            let (target, id, thread) = (kill.target, kill.id, kill.thread);
+            // the request still runs: else KILL could hit the next command
+            let runs = self
+                .conns
+                .get(target)
+                .is_some_and(|t| t.waits.front().is_some_and(|w| w.id == id));
+            if !runs {
+                close.push(k);
+                continue;
+            }
+            let c = &mut self.conns[k];
+            if let Some(kill) = c.kill.as_mut() {
+                kill.sent = true;
+            }
+            let w = Wait::new(0, What::Kill, now + c.shared.opts.timeout);
+            c.put(
+                Cmd::Query(w, format!("KILL QUERY {thread}")),
+                &mut self.ready,
+            );
+        }
+        for k in close {
+            self.close(k, None);
+        }
+        let mut start = Vec::new();
+        for (k, c) in self.conns.iter_mut() {
+            let alone = c.waits.len() == 1 && c.held.is_empty();
+            if c.kill.is_some() || c.thread == 0 || !alone {
+                continue;
+            }
+            let w = &mut c.waits[0];
+            if w.cancel && !w.killing {
+                w.killing = true;
+                if c.tx.is_none() {
+                    c.doomed = true;
+                }
+                start.push((k, w.id, c.thread, c.shared.clone()));
+            }
+        }
+        for (target, id, thread, shared) in start {
+            let until = now + shared.opts.timeout;
+            // it can not connect: the request drains
+            let Ok(mut c) = Conn::start(shared, now) else {
+                continue;
+            };
+            c.kill = Some(Kill {
+                target,
+                id,
+                thread,
+                sent: false,
+                until,
+            });
+            let entry = self.conns.vacant_entry();
+            let i = Interest::READABLE | Interest::WRITABLE;
+            if self
+                .poll
+                .registry()
+                .register(c.sock.source(), Token(entry.key()), i)
+                .is_ok()
+            {
+                entry.insert(c);
+            }
+        }
+    }
+
     /// A request in a transaction: it goes to the connection of the
     /// transaction. Commit and rollback end it.
     // ponytail: a linear scan of the connections of this link.
-    fn in_tx(&mut self, req: Request, deadline: Instant) {
+    fn in_tx(&mut self, mut req: Request) {
         let Some(key) = self
             .conns
             .iter()
@@ -1635,6 +1900,7 @@ impl Core {
         let c = &mut self.conns[key];
         c.used = self.now;
         c.dirty = true;
+        let deadline = self.now + c.shared.opts.timeout;
         match req.op {
             OP_COMMIT | OP_ROLLBACK => {
                 end_tx(req.tx);
@@ -1650,17 +1916,9 @@ impl Core {
                     &mut self.ready,
                 );
             }
-            OP_QUERY | OP_EXECUTE => {
-                let what = What::Result {
-                    rows: req.op == OP_QUERY,
-                    binary: !req.params.is_empty(),
-                };
-                c.query(
-                    Wait::new(req.id, what, deadline),
-                    req.sql,
-                    req.params,
-                    &mut self.ready,
-                );
+            OP_QUERY | OP_EXECUTE | OP_STREAM => {
+                let w = Wait::of(&mut req, deadline);
+                c.query(w, req.sql, req.params, &mut self.ready);
             }
             op => self.fail(req.id, Fail::Client(format!("unknown op {op}"))),
         }
@@ -1694,11 +1952,29 @@ impl Core {
         }
         let reqs = std::mem::take(&mut self.mail.reqs.lock().unwrap().1);
         for (mut req, from) in reqs {
+            if req.op == OP_CANCEL || req.op == OP_MORE {
+                // their id of the request: find ours
+                let theirs = match req.params.first() {
+                    Some(Param::Int(id)) => *id as u64,
+                    _ => continue,
+                };
+                let ours = self
+                    .foreign
+                    .iter()
+                    .find(|(_, (t, f))| *t == theirs && f.ptr_eq(&from))
+                    .map(|(k, _)| *k);
+                if let Some(ours) = ours {
+                    req.params[0] = Param::Int(ours as i64);
+                    req.tx = 0; // never forwarded again
+                    self.control(req);
+                }
+                continue;
+            }
             self.next_foreign += 1;
             let id = FOREIGN | self.next_foreign;
             self.foreign.insert(id, (req.id, from));
             req.id = id;
-            self.in_tx(req, self.now + TIMEOUT);
+            self.in_tx(req);
         }
     }
 
@@ -1741,12 +2017,15 @@ impl Core {
 
     /// Sends a request of pool `pid` on a connection of this link. Gives
     /// it back when there is none (the pool is at its limit).
-    fn place(&mut self, pid: u64, req: Request, deadline: Instant) -> Result<(), Request> {
-        if !matches!(req.op, OP_QUERY | OP_EXECUTE | OP_BEGIN) {
+    fn place(&mut self, pid: u64, mut req: Request, deadline: Instant) -> Result<(), Request> {
+        if !matches!(req.op, OP_QUERY | OP_EXECUTE | OP_BEGIN | OP_STREAM) {
             self.fail(req.id, Fail::Client(format!("unknown op {}", req.op)));
             return Ok(());
         }
         let begin = req.op == OP_BEGIN;
+        // a begin or a stream gets a connection of its own: a stream can
+        // run long, and nothing should wait behind it
+        let alone = begin || req.op == OP_STREAM;
         let key = loop {
             let best = self.pools[&pid]
                 .conns
@@ -1767,8 +2046,8 @@ impl Core {
                 self.fail(req.id, f);
                 return Ok(());
             }
-            // pipeline on the least busy one (not a begin)
-            match best.filter(|_| !begin) {
+            // pipeline on the least busy one (not a begin or a stream)
+            match best.filter(|_| !alone) {
                 Some(k) => {
                     let l = self.pools.get_mut(&pid).unwrap();
                     l.want |= l.full;
@@ -1788,16 +2067,10 @@ impl Core {
             let w = Wait::new(req.id, What::Begin(tx), deadline);
             c.put(Cmd::Query(w, "START TRANSACTION".into()), &mut self.ready);
         } else {
-            let what = What::Result {
-                rows: req.op == OP_QUERY,
-                binary: !req.params.is_empty(),
-            };
-            c.query(
-                Wait::new(req.id, what, deadline),
-                req.sql,
-                req.params,
-                &mut self.ready,
-            );
+            // no new command goes to a streaming connection
+            c.release |= req.op == OP_STREAM;
+            let w = Wait::of(&mut req, deadline);
+            c.query(w, req.sql, req.params, &mut self.ready);
         }
         Ok(())
     }
@@ -1900,8 +2173,11 @@ impl Core {
         }
         c.quit();
         let shared = c.shared.clone();
+        let counted = c.kill.is_none();
         drop(c);
-        shared.put_back(self.id, None);
+        if counted {
+            shared.put_back(self.id, None);
+        }
     }
 
     fn park(&mut self, key: usize) {
@@ -1945,7 +2221,7 @@ impl Core {
             .collect();
         for k in empty {
             let l = &self.pools[&pid];
-            if closed || !self.fresh_check(k) {
+            if closed || self.conns[k].doomed || !self.fresh_check(k) {
                 self.close(k, None);
             } else if self.conns[k].dirty && shared.opts.reset {
                 // it is not empty now: it may go back after the reset
@@ -2005,7 +2281,10 @@ impl Core {
         }
         // 5.
         let l = &self.pools[&pid];
-        let begin = l.queue.iter().any(|q| q.req.op == OP_BEGIN);
+        let begin = l
+            .queue
+            .iter()
+            .any(|q| matches!(q.req.op, OP_BEGIN | OP_STREAM));
         if (others(l) || begin || over(l)) && !l.conns.iter().any(|&k| self.conns[k].release) {
             let pick = l
                 .conns
@@ -2067,9 +2346,10 @@ impl Core {
         let mut soon = |t: Instant| next = Some(next.map_or(t, |n: Instant| n.min(t)));
         let mut late = Vec::new();
         for l in self.pools.values_mut() {
+            let t = l.shared.opts.timeout;
             l.queue.retain(|q| {
                 if q.deadline <= now {
-                    late.push(q.req.id);
+                    late.push((q.req.id, t));
                     false
                 } else {
                     soon(q.deadline);
@@ -2077,12 +2357,14 @@ impl Core {
                 }
             });
         }
-        for id in late {
-            self.fail(id, Fail::client(crate::TIMED_OUT));
+        for (id, t) in late {
+            self.fail(id, timed_out(t));
         }
         // an empty connection that gets too old: wake then to close it
         for (_, c) in self.conns.iter() {
-            if c.empty()
+            if let Some(k) = c.kill.as_ref().filter(|k| !k.sent) {
+                soon(k.until);
+            } else if c.empty()
                 && let Some(t) = self.ttl_due(c)
             {
                 soon(t);
@@ -2097,18 +2379,20 @@ impl Core {
                 }
                 soon(d);
             }
+            let timeout = c.shared.opts.timeout;
             if c.tx.is_some() && c.load() == 0 {
-                let due = c.used + TIMEOUT;
+                let due = c.used + timeout;
                 if due <= now {
                     c.rollback(now, &mut self.ready);
-                    soon(now + TIMEOUT);
+                    soon(now + timeout);
                 } else {
                     soon(due);
                 }
             }
         }
         for k in dead {
-            self.close(k, Some(Fail::client(TIMED_OUT)));
+            let t = self.conns[k].shared.opts.timeout;
+            self.close(k, Some(timed_out(t)));
         }
         self.next = next;
     }
@@ -2203,7 +2487,7 @@ impl Core {
                 }
             }
         }
-        if read {
+        if read && !c.paused() {
             let open = match c.fill(closed) {
                 Ok(open) => open,
                 Err(e) => return self.close(k, Some(io_fail(format!("read failed: {e}")))),
@@ -2237,6 +2521,7 @@ impl Core {
         for pid in ids {
             self.balance(pid);
         }
+        self.kills();
         self.timers();
         self.flush_all();
         self.route();

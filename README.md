@@ -62,6 +62,43 @@ void main() async {
 }
 ```
 
+### Pool settings
+
+All are optional. The defaults keep the old behavior.
+
+- `requestTimeout` (default 300 s): the longest wait for one request (a free connection, the connect and the query). Over it the request fails, and its connection is closed. A transaction with no request for this long is rolled back.
+- `maxConnectionAge` (default none): close a connection older than this, once it has no query.
+- `idleTimeout` (default 12 hours): close a connection with no traffic for this long, once it has no query.
+
+A connection that runs a query is never closed by these.
+
+### Cancel a query
+
+```dart
+MysqlCancelToken token = MysqlCancelToken();
+Future<MysqlNativeResult> slow = pool.query('SELECT SLEEP(10)', cancelToken: token);
+token.cancel(); // slow fails with MysqlQueryCancelledException
+```
+
+- `query`, `execute` and `stream` take `cancelToken`.
+- Not started yet: it does not run. Running: the driver sends `KILL QUERY` on a new connection, so the server stops it. Ended already: nothing changes.
+- When more queries wait on the same connection, the cancelled one runs to its end instead, and its rows are dropped. A late `KILL QUERY` could stop the next query, so it is not sent then.
+- A connection that got a `KILL QUERY` takes no new query, and closes once it has none. Inside a transaction it stays, and the transaction goes on.
+
+### Stream rows
+
+```dart
+await for (MysqlNativeResult chunk in pool.stream('SELECT * FROM logs', chunkSize: 1000)) {
+  print(chunk.rows.length); // up to 1000
+}
+```
+
+- Each event is a chunk of up to `chunkSize` rows, with the same columns and rows as `query`.
+- Rows are read from the server as they come. Rust reads at most 2 chunks ahead of your listener. A paused listener stops the reading, so a big result does not fill the memory.
+- Cancel the subscription (eg. `break` in `await for`) to stop the query. It is stopped with `KILL QUERY`, the rows that are still on the way are dropped, and the connection is closed.
+- Outside a transaction, a stream gets a connection of its own. Pass `transaction:` to stream inside a transaction.
+- The server stops a connection whose client does not read for `net_write_timeout` (60 s by default). Do not pause a stream for longer.
+
 ## Turn it off
 
 - For all connections: set the env var `DOX_DB_DRIVER=dart`.
@@ -87,7 +124,7 @@ If the app still opens a pool, it throws an error that says the library is not i
 - Many queries go to Rust in one call. Many results come back in one message.
 - Each connection keeps a prepared statement cache (`statementCacheSize`, 32 by default). Over it, the statement used longest ago is closed. The same SQL with other param types (eg. a number, then a string) is a separate statement.
 - TLS with rustls (`secure: true`). The login works with `caching_sha2_password` (also without TLS: the password goes RSA encrypted) and `mysql_native_password`.
-- A request waits at most 300 s. A transaction that gets no request for 300 s is rolled back.
+- A request waits at most `requestTimeout` (300 s by default). A transaction that gets no request for that long is rolled back.
 - `insertId` and `affectedRows` on each result.
 - Transactions: `pool.begin()`, `pool.commit(tx)`, `pool.rollback(tx)`.
 - Parameters as a list for `?`, or a map for `@name`.
@@ -98,6 +135,7 @@ If the app still opens a pool, it throws an error that says the library is not i
 `MysqlNativePool.fromUrl()` takes the URL options that mysql_async took, so old URLs still work.
 
 These work like before: `pool_max`, `pool_min`, `stmt_cache_size`, `conn_ttl` (close a connection with no traffic for this many seconds), `wait_timeout` (the same, when `conn_ttl` is not set), `inactive_connection_ttl` (close idle connections over `pool_min`), `abs_conn_ttl` and `abs_conn_ttl_jitter` (close a connection after this age, once it has no query), `reset_connection` (on by default: reset the session when a connection has no query left), `tcp_keepalive` (milliseconds), `socket`, `require_ssl`, `verify_ca`, `verify_identity`, `built_in_roots`, `client_found_rows`, `tcp_nodelay` and `enable_cleartext_plugin`.
+`request_timeout_ms` is new: `requestTimeout` in milliseconds (300000 by default).
 `ssl_ca` is new: the path of a PEM file with more CA certificates to trust, eg. a private CA. The Mozilla roots stay trusted, unless `built_in_roots=false`. In `MysqlNativePool.open()` it is `sslRootCert`.
 `MysqlNativePool.open()` sets `reset_connection=false`, so the prepared statements stay.
 
