@@ -1956,9 +1956,13 @@ impl Core {
                 match same_server(&c.shared.opts, kill.ident.as_deref(), c.ident.as_deref()) {
                     Some(true) => send.push(k),
                     Some(false) => {
-                        kill_failed(&Fail::client(
-                            "the kill connection reached another server, so no KILL was sent",
-                        ));
+                        let known = |i: &Option<Vec<u8>>| i.as_ref().is_some_and(|i| !i.is_empty());
+                        let why = if known(&kill.ident) && known(&c.ident) {
+                            "the kill connection reached another server, so no KILL was sent"
+                        } else {
+                            "could not read the server name, so no KILL was sent"
+                        };
+                        kill_failed(&Fail::client(why));
                         close.push(k);
                     }
                     None => {}
@@ -2014,7 +2018,25 @@ impl Core {
         }
         for (target, id, thread) in start {
             let kill = self.start_kill(target, thread, Some((target, id)));
+            if kill.is_none() {
+                self.cancel_now(target, id);
+            }
             self.conns[target].hold = kill;
+        }
+    }
+
+    /// A cancelled request whose KILL was skipped: Dart gets the cancel
+    /// now, like with `server_kill` off. The query drains on the server,
+    /// its rows are dropped (its id is gone).
+    fn cancel_now(&mut self, target: usize, id: u64) {
+        if let Some(c) = self.conns.get_mut(target)
+            && let Some(w) = c
+                .waits
+                .iter_mut()
+                .find(|w| w.id == id && w.cancel && matches!(w.what, What::Result { .. }))
+        {
+            push(&mut self.ready, record(id, Err(Fail::Cancelled)));
+            w.id = 0;
         }
     }
 
@@ -2376,6 +2398,13 @@ impl Core {
             {
                 t.hold = None;
                 t.release_held(&mut self.ready);
+            }
+            // no KILL went out: Dart gets the cancel now, not when the
+            // query ends on the server
+            if !kill.sent
+                && let Some((t, id)) = kill.target
+            {
+                self.cancel_now(t, id);
             }
         }
         if let Some(f) = why {
@@ -3582,6 +3611,83 @@ mod tests {
             other.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
+    }
+
+    /// A link core with no Dart side, for tests of the loop.
+    #[cfg(unix)]
+    fn core() -> super::Core {
+        use std::collections::HashMap;
+        super::Core {
+            poll: mio::Poll::new().unwrap(),
+            events: mio::Events::with_capacity(16),
+            stored: false,
+            conns: slab::Slab::new(),
+            pools: HashMap::new(),
+            ready: Vec::new(),
+            now: std::time::Instant::now(),
+            next: None,
+            id: 0,
+            me: std::sync::Weak::new(),
+            evs: Vec::new(),
+            mail: Default::default(),
+            foreign: HashMap::new(),
+            next_foreign: 0,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn start_kill_uses_the_peer_of_its_target_not_the_dns_list() {
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        other.set_nonblocking(true).unwrap();
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut core = core();
+        let mut c = new_conn(true, false, true);
+        // the other server is first in the DNS list
+        *c.shared.addrs.lock().unwrap() =
+            vec![other.local_addr().unwrap(), target.local_addr().unwrap()];
+        c.peer = Some(target.local_addr().unwrap());
+        c.ident = Some(b"uuid-a".to_vec());
+        c.thread = 7;
+        let t = core.conns.insert(c);
+        let k = core.start_kill(t, 7, None).expect("a kill connection");
+        target.accept().unwrap();
+        let wb = std::io::ErrorKind::WouldBlock;
+        assert_eq!(other.accept().unwrap_err().kind(), wb);
+        assert_eq!(
+            core.conns[k].kill.as_ref().unwrap().ident.as_deref(),
+            Some(&b"uuid-a"[..])
+        );
+        // no peer: no kill connection, nothing is dialed
+        core.conns[t].peer = None;
+        assert!(core.start_kill(t, 7, None).is_none());
+        assert_eq!(other.accept().unwrap_err().kind(), wb);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_skipped_kill_gives_the_cancel_to_dart_at_once() {
+        let mut core = core();
+        let mut c = new_conn(true, false, true);
+        c.thread = 7;
+        // the server name could not be read: no KILL
+        c.ident = Some(Vec::new());
+        c.peer = Some("127.0.0.1:9".parse().unwrap());
+        let what = What::Result {
+            rows: true,
+            binary: false,
+        };
+        c.put(
+            Cmd::Query(wait(5, what), "SELECT SLEEP(9)".into()),
+            &mut Vec::new(),
+        );
+        c.waits[0].cancel = true;
+        let t = core.conns.insert(c);
+        core.kills();
+        assert_eq!(records(&core.ready).unwrap(), vec![(5, 1)]);
+        // the query drains with no id: no second answer
+        assert_eq!(core.conns[t].waits[0].id, 0);
+        assert!(core.conns[t].hold.is_none());
     }
 
     #[test]
