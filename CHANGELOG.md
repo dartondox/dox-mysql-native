@@ -23,7 +23,6 @@
 - New `MysqlCancelToken`. `query`, `execute` and `stream` take `cancelToken:`. `cancel()` stops the query: one that did not start does not run, a running one is stopped on the server with `KILL QUERY`. The query then fails with the new `MysqlQueryCancelledException` (a `MysqlException`). A connection that got a `KILL QUERY` closes once it has no query, so the pool stays clean.
 - New `stream()`: the rows of a query in chunks of `chunkSize` rows (1000 by default). Rows are read from the server as they come, and Rust reads at most 2 chunks ahead of the listener, so a big result does not fill the memory. Cancelling the subscription stops the query. Works inside a transaction.
 - The FFI record layout has new ops and a new status. The native ABI version goes up at the next release.
-- Requires Dart 3.14 or newer.
 - Fix: `--` with no space after it is not a comment in MySQL, and is no longer read as one when a schema change is looked for.
 - Fix: a schema change in a multi-statement query (eg. `SELECT 1; ALTER TABLE t ...`) is now seen, so the statements are prepared again.
 - Fix: with the sql_mode `NO_BACKSLASH_ESCAPES`, a backslash is a plain char, so `'a\'` is a whole string. The schema change check read it as an escape, so it could miss a `CREATE`, `ALTER`, `DROP` or `RENAME` after such a string. Now sql with a backslash is read both ways, and a schema change in either way counts. In rare cases this counts a change that is not one. Then the statements are only prepared again, which is safe.
