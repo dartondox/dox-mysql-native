@@ -69,6 +69,9 @@ Future<ServerSocket> _serve(
         0,
       ]),
     );
+    // a client may close while an answer is written (eg. a kill
+    // connection that sends no KILL)
+    s.done.then((_) {}, onError: (Object _) {});
     List<int> buf = <int>[];
     bool login = true;
     s.listen((List<int> data) {
@@ -208,5 +211,110 @@ void main() {
       pool.close();
       await server.close();
     });
+  });
+
+  test('no KILL when the kill connection reaches another server', () async {
+    // each query gets a new first value, so the server name of the kill
+    // connection is not the one of its target: like a load balancer that
+    // sends each connection to another server
+    int n = 0;
+    List<String> queries = <String>[];
+    ServerSocket server = await _serve(
+      () => <List<int>>[
+        <int>[..._str('server-${n++}'.codeUnits), ..._str('{}'.codeUnits)],
+      ],
+      queries: queries,
+    );
+    MysqlNativePool pool = MysqlNativePool.fromUrl(
+      'mysql://u:pw@127.0.0.1:${server.port}/db',
+    );
+    Completer<void> first = Completer<void>();
+    StreamSubscription<MysqlNativeResult> sub = pool
+        .stream('SELECT 5 /* HOLD */', chunkSize: 1)
+        .listen((MysqlNativeResult _) {
+          if (!first.isCompleted) first.complete();
+        }, onError: (Object _) {});
+    await first.future.timeout(const Duration(seconds: 10));
+    unawaited(sub.cancel());
+    // the kill connection logs in and asks the server name
+    bool asked() =>
+        queries.where((String q) => q.contains('@@server_uuid')).length >= 2;
+    for (int i = 0; i < 100 && !asked(); i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+    expect(asked(), isTrue);
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    expect(queries.where((String q) => q.startsWith('KILL')), isEmpty);
+    pool.close();
+    await server.close();
+  });
+
+  test('a cancel with no KILL (another server) returns at once', () async {
+    int n = 0;
+    List<String> queries = <String>[];
+    ServerSocket server = await _serve(
+      () => <List<int>>[
+        <int>[..._str('server-${n++}'.codeUnits), ..._str('{}'.codeUnits)],
+      ],
+      queries: queries,
+    );
+    MysqlNativePool pool = MysqlNativePool.fromUrl(
+      'mysql://u:pw@127.0.0.1:${server.port}/db',
+    );
+    MysqlCancelToken token = MysqlCancelToken();
+    // a query that never ends on the server
+    Future<MysqlNativeResult> slow = pool.query(
+      'SELECT 6 /* HOLD */',
+      cancelToken: token,
+    );
+    for (int i = 0; i < 100 && !queries.contains('SELECT 6 /* HOLD */'); i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+    token.cancel();
+    await expectLater(
+      slow.timeout(const Duration(seconds: 5)),
+      throwsA(isA<MysqlQueryCancelledException>()),
+    );
+    expect(queries.where((String q) => q.startsWith('KILL')), isEmpty);
+    pool.close();
+    await server.close();
+  });
+
+  test('a timeout with no KILL (another server) fails on time', () async {
+    int n = 0;
+    List<String> queries = <String>[];
+    ServerSocket server = await _serve(
+      () => <List<int>>[
+        <int>[..._str('server-${n++}'.codeUnits), ..._str('{}'.codeUnits)],
+      ],
+      queries: queries,
+    );
+    MysqlNativePool pool = MysqlNativePool.fromUrl(
+      'mysql://u:pw@127.0.0.1:${server.port}/db?request_timeout_ms=1000',
+    );
+    Stopwatch watch = Stopwatch()..start();
+    // a query that never ends on the server
+    await expectLater(
+      pool.query('SELECT 7 /* HOLD */').timeout(const Duration(seconds: 5)),
+      throwsA(
+        isA<MysqlException>().having(
+          (MysqlException e) => e.message,
+          'message',
+          contains('timeout, no answer in 1 s'),
+        ),
+      ),
+    );
+    expect(watch.elapsed, lessThan(const Duration(seconds: 3)));
+    // the kill connection logs in and asks the server name
+    bool asked() =>
+        queries.where((String q) => q.contains('@@server_uuid')).length >= 2;
+    for (int i = 0; i < 100 && !asked(); i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+    expect(asked(), isTrue);
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    expect(queries.where((String q) => q.startsWith('KILL')), isEmpty);
+    pool.close();
+    await server.close();
   });
 }

@@ -1,5 +1,8 @@
 ## Unreleased
 
+- Fix: the KILL for a timed out or cancelled query could reach another server. A thread id means something on one server only, so the KILL could stop another session there and roll back its transaction. This could happen with failover, a host name with many addresses, or a load balancer. Now the KILL connection goes only to the address of the query's connection. Each TCP connection also reads the server name once after its login (`@@server_uuid`, on MariaDB the hostname, port and server_id), in the same write as its first query. The KILL is only sent when both connections got the same name. Else no KILL is sent and a warning is printed.
+  - With `serverKill` on (the default), every new TCP connection now runs one small query that names the server. It shows in the general log and the audit log of the server. A normal query does not wait for it.
+  - When no KILL is sent, a cancelled query now fails in Dart at once with `MysqlQueryCancelledException`, like with `serverKill: false`. The query runs to its end on the server.
 - New fuzz targets for the code that reads the server bytes (packets, rows, login packets, a whole connection, round trips), run by CI. They found these bugs, all fixed:
   - Fix: a server that sent an auth switch with no nonce, then asked for the RSA login, made the process abort (a divide by zero). Now the login fails with an error.
   - Fix: a DATETIME text with a multi-byte char in the fraction made the process abort. Now it stays text.
