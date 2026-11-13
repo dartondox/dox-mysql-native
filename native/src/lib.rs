@@ -327,6 +327,9 @@ struct Shared {
     /// waits for DNS)
     addrs: Mutex<Vec<std::net::SocketAddr>>,
     resolving: AtomicBool,
+    /// the "server name not known, no KILL" warning was printed (once per
+    /// pool: a server with no name query would print it on each cancel)
+    name_warned: AtomicBool,
     state: Mutex<PoolState>,
     /// how many links wait for a connection (`state.waiters.len()`)
     waiting: AtomicUsize,
@@ -814,6 +817,7 @@ pub unsafe extern "C" fn dox_mysql_connect(
             tls,
             addrs: Mutex::new(addrs),
             resolving: AtomicBool::new(false),
+            name_warned: AtomicBool::new(false),
             state: Mutex::new(PoolState::default()),
             waiting: AtomicUsize::new(0),
             hungry: AtomicUsize::new(0),

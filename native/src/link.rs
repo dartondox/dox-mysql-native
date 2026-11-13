@@ -2064,7 +2064,14 @@ impl Core {
         {
             Conn::start_at(shared, addr, now)
         } else {
-            Err(Fail::client("the server of the connection is not known"))
+            // a server with no name query (eg. an old one) has this on
+            // each cancel and timeout: warn once per pool
+            if !shared.name_warned.swap(true, Ordering::Relaxed) {
+                kill_failed(&Fail::client(
+                    "the server of the connection is not known (said once per pool)",
+                ));
+            }
+            return None;
         };
         {
             let mut c = match started {
@@ -3123,6 +3130,7 @@ mod harness {
             tls: None,
             addrs: Mutex::new(Vec::new()),
             resolving: AtomicBool::new(false),
+            name_warned: AtomicBool::new(false),
             state: Mutex::new(Default::default()),
             waiting: AtomicUsize::new(0),
             hungry: AtomicUsize::new(0),
@@ -3662,6 +3670,13 @@ mod tests {
         core.conns[t].peer = None;
         assert!(core.start_kill(t, 7, None).is_none());
         assert_eq!(other.accept().unwrap_err().kind(), wb);
+        // its warning is said once per pool
+        assert!(
+            core.conns[t]
+                .shared
+                .name_warned
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 
     #[cfg(unix)]

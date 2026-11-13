@@ -279,4 +279,42 @@ void main() {
     pool.close();
     await server.close();
   });
+
+  test('a timeout with no KILL (another server) fails on time', () async {
+    int n = 0;
+    List<String> queries = <String>[];
+    ServerSocket server = await _serve(
+      () => <List<int>>[
+        <int>[..._str('server-${n++}'.codeUnits), ..._str('{}'.codeUnits)],
+      ],
+      queries: queries,
+    );
+    MysqlNativePool pool = MysqlNativePool.fromUrl(
+      'mysql://u:pw@127.0.0.1:${server.port}/db?request_timeout_ms=1000',
+    );
+    Stopwatch watch = Stopwatch()..start();
+    // a query that never ends on the server
+    await expectLater(
+      pool.query('SELECT 7 /* HOLD */').timeout(const Duration(seconds: 5)),
+      throwsA(
+        isA<MysqlException>().having(
+          (MysqlException e) => e.message,
+          'message',
+          contains('timeout, no answer in 1 s'),
+        ),
+      ),
+    );
+    expect(watch.elapsed, lessThan(const Duration(seconds: 3)));
+    // the kill connection logs in and asks the server name
+    bool asked() =>
+        queries.where((String q) => q.contains('@@server_uuid')).length >= 2;
+    for (int i = 0; i < 100 && !asked(); i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+    expect(asked(), isTrue);
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    expect(queries.where((String q) => q.startsWith('KILL')), isEmpty);
+    pool.close();
+    await server.close();
+  });
 }
