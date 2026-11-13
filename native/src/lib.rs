@@ -64,7 +64,7 @@ pub mod fuzz {
 }
 
 /// Bump when the FFI functions or the record layout change.
-const ABI_VERSION: i32 = 3;
+const ABI_VERSION: i32 = 4;
 
 const OP_QUERY: u8 = 0;
 const OP_EXECUTE: u8 = 1;

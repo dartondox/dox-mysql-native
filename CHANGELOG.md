@@ -1,4 +1,4 @@
-## Unreleased
+## 3.2.0
 
 - Fix: the KILL for a timed out or cancelled query could reach another server. A thread id means something on one server only, so the KILL could stop another session there and roll back its transaction. This could happen with failover, a host name with many addresses, or a load balancer. Now the KILL connection goes only to the address of the query's connection. Each TCP connection also reads the server name once after its login (`@@server_uuid`, on MariaDB the hostname, port and server_id), in the same write as its first query. The KILL is only sent when both connections got the same name. Else no KILL is sent and a warning is printed.
   - With `serverKill` on (the default), every new TCP connection now runs one small query that names the server. It shows in the general log and the audit log of the server. A normal query does not wait for it.
@@ -22,7 +22,7 @@
 - Fix: `maxConnectionAge` was used as the idle time (no traffic) of a connection, not its age. Now it is the age, like its name says, and `idleTimeout` is the idle time. Its type is now `Duration?`. Old code that passes a `Duration` still compiles.
 - New `MysqlCancelToken`. `query`, `execute` and `stream` take `cancelToken:`. `cancel()` stops the query: one that did not start does not run, a running one is stopped on the server with `KILL QUERY`. The query then fails with the new `MysqlQueryCancelledException` (a `MysqlException`). A connection that got a `KILL QUERY` closes once it has no query, so the pool stays clean.
 - New `stream()`: the rows of a query in chunks of `chunkSize` rows (1000 by default). Rows are read from the server as they come, and Rust reads at most 2 chunks ahead of the listener, so a big result does not fill the memory. Cancelling the subscription stops the query. Works inside a transaction.
-- The FFI record layout has new ops and a new status. The native ABI version goes up at the next release.
+- Native ABI 4. The FFI record layout has new ops and a new status.
 - Fix: `--` with no space after it is not a comment in MySQL, and is no longer read as one when a schema change is looked for.
 - Fix: a schema change in a multi-statement query (eg. `SELECT 1; ALTER TABLE t ...`) is now seen, so the statements are prepared again.
 - Fix: with the sql_mode `NO_BACKSLASH_ESCAPES`, a backslash is a plain char, so `'a\'` is a whole string. The schema change check read it as an escape, so it could miss a `CREATE`, `ALTER`, `DROP` or `RENAME` after such a string. Now sql with a backslash is read both ways, and a schema change in either way counts. In rare cases this counts a change that is not one. Then the statements are only prepared again, which is safe.
