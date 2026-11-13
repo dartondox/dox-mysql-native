@@ -92,12 +92,15 @@ class MysqlNativePool {
   ///
   /// [serverKill] (default true): a cancelled or timed out query is
   /// stopped on the server with `KILL QUERY` or `KILL`, sent on a new
-  /// connection. Turn it off when the database is behind a proxy or load
-  /// balancer: the new connection may reach another server, and then the
-  /// KILL may hit another session. Off: a cancelled query runs to its end
-  /// on the server and only its result is dropped, and a timed out query
-  /// only has its socket closed. The new connection also counts for
-  /// `max_user_connections`. A KILL that fails prints a warning on stderr.
+  /// connection. The new connection goes only to the address of the
+  /// query's connection, and the KILL is only sent when it reached the
+  /// same server (same `@@server_uuid`, on MariaDB same hostname, port and
+  /// server_id). Else no KILL is sent. Turn it off behind a proxy that
+  /// has its own connection ids (eg. ProxySQL). Off: a cancelled query
+  /// runs to its end on the server and only its result is dropped, and a
+  /// timed out query only has its socket closed. The new connection also
+  /// counts for `max_user_connections`. A KILL that fails prints a warning
+  /// on stderr.
   ///
   /// [maxConnectionAge] closes a connection that is older than this, once
   /// it has no query (so a connection in use is never closed). null: no
@@ -414,9 +417,9 @@ class MysqlQueryCancelledException extends MysqlException {
 /// - A running query is stopped on the server with `KILL QUERY`, sent on a
 ///   new connection. When more queries wait on the same connection, it
 ///   runs to its end instead, and its rows are dropped.
-/// - Behind a proxy or load balancer the new connection may reach another
-///   server, so turn the KILL off with `serverKill: false` in
-///   [MysqlNativePool.open]. Then the query fails at once, but runs to its
+/// - The KILL is only sent when the new connection reached the same
+///   server. Behind a proxy with its own connection ids, turn the KILL off
+///   with `serverKill: false` in [MysqlNativePool.open]. Then the query fails at once, but runs to its
 ///   end on the server. The KILL connection also counts for
 ///   `max_user_connections`. A KILL that fails prints a warning on stderr.
 /// - A query that ended already is not changed.

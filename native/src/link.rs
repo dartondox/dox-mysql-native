@@ -157,6 +157,15 @@ impl Sock {
         }
     }
 
+    /// the server address of a TCP socket
+    fn peer(&self) -> Option<SocketAddr> {
+        match self {
+            Sock::Tcp(s) => s.peer_addr().ok(),
+            #[cfg(unix)]
+            Sock::Unix(_) => None,
+        }
+    }
+
     /// true when a non-blocking connect is done. Err: it failed.
     fn connected(&self) -> io::Result<bool> {
         let (err, peer) = match self {
@@ -243,6 +252,8 @@ enum What {
     Reset,
     /// KILL QUERY on a kill connection: nobody waits, an error is ignored
     Kill,
+    /// the query that names the server (see [ident_sql]): nobody waits
+    Ident,
 }
 
 /// Where the answer of a command is.
@@ -344,6 +355,40 @@ struct Kill {
     sent: bool,
     /// give up when it is not sent by then
     until: Instant,
+    /// the server name of the target connection (see [Conn::ident]): the
+    /// KILL is only sent when the kill connection got the same one
+    ident: Option<Vec<u8>>,
+}
+
+/// The query that names a server, so a kill connection can check that it
+/// reached the server of its target. It goes behind the login of each TCP
+/// connection when `server_kill` is on, in the same write as the first
+/// command (no extra wait). MariaDB has no `server_uuid`.
+// ponytail: on MariaDB two servers with the same hostname, port and
+// server_id look the same. Containers and hosts have their own hostname.
+fn ident_sql(maria: bool) -> &'static str {
+    if maria {
+        "SELECT CONCAT_WS(':', @@hostname, @@port, @@server_id)"
+    } else {
+        "SELECT @@server_uuid"
+    }
+}
+
+/// A connection checks which server it reached: over TCP with
+/// `server_kill` on (a Unix socket has one server).
+fn wants_ident(o: &crate::Opts) -> bool {
+    o.server_kill && o.socket.is_none()
+}
+
+/// The KILL of a kill connection may go: the target's server name is
+/// known, not empty, and the same as the kill connection's own. None: the
+/// kill connection has no answer for its own name yet.
+fn same_server(o: &crate::Opts, target: Option<&[u8]>, mine: Option<&[u8]>) -> Option<bool> {
+    if !wants_ident(o) {
+        return Some(true);
+    }
+    let mine = mine?;
+    Some(target.is_some_and(|t| !t.is_empty() && t == mine))
 }
 
 /// A command that is not sent yet: the connection logs in, or a command
@@ -530,6 +575,13 @@ pub(crate) struct Conn {
     /// wait until it has its answer, so the KILL can only hit the query it
     /// is for
     hold: Option<usize>,
+    /// the server address this TCP connection reached: its kill
+    /// connection goes only there (a thread id means something on one
+    /// server only)
+    peer: Option<SocketAddr>,
+    /// the server name (see [ident_sql]). None: not known yet. Empty: the
+    /// query failed, so no KILL is sent for it.
+    ident: Option<Vec<u8>>,
 }
 
 /// The addresses of a host (a blocking DNS lookup: only when a pool opens,
@@ -612,6 +664,20 @@ impl Conn {
         Ok(Conn::new(shared, sock, phase, now))
     }
 
+    /// Starts a kill connection to the address of its target only: no
+    /// DNS list, no other address. A thread id on another server is
+    /// another session.
+    fn start_at(shared: Arc<Shared>, addr: SocketAddr, now: Instant) -> Result<Conn, Fail> {
+        let s = TcpStream::connect(addr)
+            .map_err(|e| dial_fail(&shared.opts, format!("{e} ({addr})")))?;
+        Ok(Conn::new(
+            shared,
+            Sock::Tcp(s),
+            Phase::Connect(Vec::new()),
+            now,
+        ))
+    }
+
     /// A connection over a socket, in this phase.
     fn new(shared: Arc<Shared>, sock: Sock, phase: Phase, now: Instant) -> Conn {
         let max_age = max_age(&shared.opts);
@@ -646,6 +712,8 @@ impl Conn {
             doomed: false,
             kill: None,
             hold: None,
+            peer: None,
+            ident: None,
         }
     }
 
@@ -998,7 +1066,7 @@ impl Conn {
             res = if self.ready() {
                 self.packet(&payload, ready, now)
             } else {
-                self.login(&payload, ready)
+                self.login(&payload, ready, now)
             };
             if res.is_err() {
                 break;
@@ -1024,7 +1092,7 @@ impl Conn {
     }
 
     /// A packet of the login.
-    fn login(&mut self, b: &[u8], ready: &mut Vec<u8>) -> Result<(), Fail> {
+    fn login(&mut self, b: &[u8], ready: &mut Vec<u8>, now: Instant) -> Result<(), Fail> {
         let shared = self.shared.clone();
         let o = &shared.opts;
         let pw = &o.pass;
@@ -1085,6 +1153,12 @@ impl Conn {
             } => match b.first() {
                 Some(0x00) => {
                     self.phase = Phase::Ready;
+                    if wants_ident(o) {
+                        let w = Wait::new(0, What::Ident, now + o.timeout);
+                        let sql = ident_sql(self.maria).to_string();
+                        // in front of the commands held for the login
+                        self.held.push_front(Cmd::Query(w, sql));
+                    }
                     self.release_held(ready);
                 }
                 Some(0xFF) => return Err(proto::err_packet(b)),
@@ -1260,6 +1334,13 @@ impl Conn {
                     } else {
                         w.st = St::Head;
                     }
+                } else if matches!(w.what, What::Ident) {
+                    if self.ident.is_none() {
+                        // a NULL (0xFB) or a bad row: empty, no KILL
+                        let mut p = 0;
+                        let v = proto::lenenc_bytes(b, &mut p).filter(|_| head != 0xFB);
+                        self.ident = Some(v.unwrap_or_default().to_vec());
+                    }
                 } else if w.first && rows && !w.cancel {
                     let ok = if binary {
                         proto::binary_row(&mut w.out, b, &w.cols)
@@ -1332,6 +1413,10 @@ impl Conn {
                 Some(Fail::Server { code: 1094, .. }) | None => {}
                 Some(f) => kill_failed(&f),
             },
+            // no row or an error: empty, so no KILL is sent for it
+            What::Ident => {
+                self.ident.get_or_insert_with(Vec::new);
+            }
             What::Prepare(_) | What::Reset => {}
         }
     }
@@ -1868,7 +1953,16 @@ impl Core {
                 kill_failed(&Fail::client("no answer in time"));
                 close.push(k);
             } else if c.ready() {
-                send.push(k);
+                match same_server(&c.shared.opts, kill.ident.as_deref(), c.ident.as_deref()) {
+                    Some(true) => send.push(k),
+                    Some(false) => {
+                        kill_failed(&Fail::client(
+                            "the kill connection reached another server, so no KILL was sent",
+                        ));
+                        close.push(k);
+                    }
+                    None => {}
+                }
             }
         }
         for k in send {
@@ -1915,29 +2009,43 @@ impl Core {
                 if c.tx.is_none() {
                     c.doomed = true;
                 }
-                start.push((k, w.id, c.thread, c.shared.clone()));
+                start.push((k, w.id, c.thread));
             }
         }
-        for (target, id, thread, shared) in start {
-            let kill = self.start_kill(shared, thread, Some((target, id)));
+        for (target, id, thread) in start {
+            let kill = self.start_kill(target, thread, Some((target, id)));
             self.conns[target].hold = kill;
         }
     }
 
-    /// Opens a kill connection for server thread `thread` (see [Kill]).
-    /// When it can not connect, nothing is killed: a cancelled request
-    /// drains.
+    /// Opens a kill connection for server thread `thread` of connection
+    /// `of` (see [Kill]). Over TCP it goes only to the address `of`
+    /// reached, and sends the KILL only on the same server (see
+    /// [same_server]). When it can not connect, nothing is killed: a
+    /// cancelled request drains.
     /// Returns its key.
     fn start_kill(
         &mut self,
-        shared: Arc<Shared>,
+        of: usize,
         thread: u32,
         target: Option<(usize, u64)>,
     ) -> Option<usize> {
         let now = self.now;
+        let t = &self.conns[of];
+        let shared = t.shared.clone();
+        let ident = t.ident.clone();
         let until = now + shared.opts.timeout;
+        let started = if shared.opts.socket.is_some() {
+            Conn::start(shared, now)
+        } else if let Some(addr) = t.peer
+            && ident.as_ref().is_some_and(|i| !i.is_empty())
         {
-            let mut c = match Conn::start(shared, now) {
+            Conn::start_at(shared, addr, now)
+        } else {
+            Err(Fail::client("the server of the connection is not known"))
+        };
+        {
+            let mut c = match started {
                 Ok(c) => c,
                 Err(f) => {
                     kill_failed(&f);
@@ -1949,6 +2057,7 @@ impl Core {
                 thread,
                 sent: false,
                 until,
+                ident,
             });
             let entry = self.conns.vacant_entry();
             let i = Interest::READABLE | Interest::WRITABLE;
@@ -2498,8 +2607,8 @@ impl Core {
             // sees it when it writes. So kill its server thread.
             if c.kill.is_none() && c.thread != 0 && !c.waits.is_empty() && c.shared.opts.server_kill
             {
-                let (shared, thread) = (c.shared.clone(), c.thread);
-                self.start_kill(shared, thread, None);
+                let thread = c.thread;
+                self.start_kill(k, thread, None);
                 // wake to give up on it, if it can not log in
                 let until = now + t;
                 next = Some(next.map_or(until, |n| n.min(until)));
@@ -2565,6 +2674,7 @@ impl Core {
             match c.sock.connected() {
                 Ok(false) => return,
                 Ok(true) => {
+                    c.peer = c.sock.peer();
                     c.sock.tune(c.shared.opts.nodelay, c.shared.opts.keepalive);
                     c.phase = Phase::Greeting;
                     c.writable = false;
@@ -3441,5 +3551,92 @@ mod tests {
         assert!(!is_ddl("SELECT \"x\"\"; DROP\""));
         assert!(!is_ddl("SELECT 1 /* ; ALTER */"));
         assert!(!is_ddl("SELECT 'not closed; ALTER"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_kill_connection_goes_only_to_the_address_of_its_target() {
+        use std::time::Instant;
+        // the DNS list has another server first: it must get nothing
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        other.set_nonblocking(true).unwrap();
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let shared = super::harness::shared(false);
+        *shared.addrs.lock().unwrap() = vec![other.local_addr().unwrap()];
+        let at = target.local_addr().unwrap();
+        let c = super::Conn::start_at(shared.clone(), at, Instant::now()).unwrap();
+        target.accept().unwrap();
+        assert_eq!(
+            other.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(c);
+        // no fallback: an address that can not be reached fails, and no
+        // other address is tried
+        drop(target);
+        if let Ok(c) = super::Conn::start_at(shared, at, Instant::now()) {
+            // a non-blocking connect may fail later: it has no next address
+            assert!(matches!(&c.phase, super::Phase::Connect(a) if a.is_empty()));
+        }
+        assert_eq!(
+            other.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn a_kill_goes_only_to_the_same_server() {
+        use super::same_server;
+        let tcp = parse_url("mysql://u:pw@db:3306/d").unwrap();
+        let (a, b): (&[u8], &[u8]) = (b"uuid-a", b"uuid-b");
+        assert_eq!(same_server(&tcp, Some(a), Some(a)), Some(true));
+        assert_eq!(same_server(&tcp, Some(a), Some(b)), Some(false));
+        // the kill connection has no answer yet: wait
+        assert_eq!(same_server(&tcp, Some(a), None), None);
+        // a name that is not known or empty (the query failed): no KILL
+        assert_eq!(same_server(&tcp, None, Some(a)), Some(false));
+        assert_eq!(same_server(&tcp, Some(b""), Some(b"")), Some(false));
+        // a Unix socket has one server: no check
+        let unix = parse_url("mysql://u:pw@localhost/d?socket=/tmp/m.sock").unwrap();
+        assert_eq!(same_server(&unix, None, None), Some(true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_server_name_is_read_first_after_the_login() {
+        let mut c = new_conn(true, false, false);
+        let mut ready = Vec::new();
+        let mut greeting = b"\x0a8.4.0\0".to_vec();
+        greeting.extend_from_slice(&7u32.to_le_bytes());
+        greeting.extend_from_slice(b"abcdefgh\0");
+        greeting.extend_from_slice(&0x8000u16.to_le_bytes());
+        greeting.extend_from_slice(&[45, 2, 0, 8, 0, 21]);
+        greeting.extend_from_slice(&[0; 10]);
+        greeting.extend_from_slice(b"ijklmnopqrst\0mysql_native_password\0");
+        feed(&mut c, &mut ready, &framed(0, &greeting)).unwrap();
+        // a request that waits for the login
+        let what = What::Result {
+            rows: true,
+            binary: false,
+        };
+        c.put(Cmd::Query(wait(1, what), "SELECT 1".into()), &mut ready);
+        feed(&mut c, &mut ready, &framed(2, &[0, 0, 0, 2, 0, 0, 0])).unwrap();
+        // the name query goes before the request
+        assert!(matches!(c.waits[0].what, What::Ident));
+        let out = String::from_utf8_lossy(&c.out);
+        let (ident, req) = (
+            out.find("@@server_uuid").unwrap(),
+            out.find("SELECT 1").unwrap(),
+        );
+        assert!(ident < req);
+        let mut wire = framed(1, &[1]);
+        wire.extend(framed(2, &column(b"u")));
+        wire.extend(framed(3, b"\x06uuid-a"));
+        wire.extend(framed(4, &[0xFE, 0, 0, 2, 0, 0, 0]));
+        feed(&mut c, &mut ready, &wire).unwrap();
+        assert_eq!(c.ident.as_deref(), Some(&b"uuid-a"[..]));
+        assert_eq!(c.waits.len(), 1);
+        // nothing goes to Dart for it
+        assert!(ready.is_empty());
     }
 }

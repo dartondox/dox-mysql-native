@@ -74,7 +74,7 @@ All are optional. The defaults keep the old behavior.
 
 A connection that runs a query is never closed by these.
 
-The KILL goes on a new connection. Behind a proxy or load balancer (eg. ProxySQL, or a cloud endpoint over many servers), that connection may reach another server, and the KILL may hit another session. Set `serverKill: false` there. Then a cancelled query fails at once in Dart but runs to its end on the server, and a timed out query only has its socket closed. The KILL connection also counts for `max_user_connections`. A KILL that fails (eg. no free connection) prints a warning on stderr.
+The KILL goes on a new connection. That connection goes only to the address of the query's connection. Before the KILL, the driver checks that it reached the same server (`@@server_uuid`, on MariaDB the hostname, port and server_id). If not, no KILL is sent and a warning is printed. Behind a proxy that has its own connection ids (eg. ProxySQL), set `serverKill: false`. Then a cancelled query fails at once in Dart but runs to its end on the server, and a timed out query only has its socket closed. The KILL connection also counts for `max_user_connections`. A KILL that fails (eg. no free connection) prints a warning on stderr.
 
 ### Cancel a query
 
