@@ -39,15 +39,15 @@ const List<int> _waitSeconds = <int>[1, 3];
 /// `dart run tool/native_hashes.dart v<version>`
 const Map<String, String> _sha256 = <String, String>{
   'dox_mysql_native-linux-arm64.so':
-      'edada01ed2f204ac50fe5ac7403afe753cea3e6fd72ef254561f08d9dac60dcf',
+      '5546a3b7f8a021bcb4906e548b52d850a4e1ecda4715fd14e5fa5670099f123d',
   'dox_mysql_native-linux-x64.so':
-      '716eb23f7712b28dad25a9dd5e1c9a2c8faf5dff675e24e2c9e949223118b59c',
+      'b3f1859e1a3b86e5598672819b6561b502c39b815b546e2842c4f8080e7c79c2',
   'dox_mysql_native-macos-arm64.dylib':
-      '4a3d83d70c022c7fbe963c69db466dd55f502b8e12e3747203988147b5d7f3d0',
+      'acac15786918511a940dd3b091d3fd7941d1eccd7902dbce003bb3f07cee26f7',
   'dox_mysql_native-macos-x64.dylib':
-      '52db088c3e0c93aa1bdb8784e7db88549964611d25d736a4bb5ac16ba0ec4c28',
+      '9a6de73848c8c87bc3f671670010d4acba6b34e6de2cb7d035659eb4bc644a97',
   'dox_mysql_native-windows-x64.dll':
-      '7ac4d35eb2dfc08c3cd612864724bd2a651453593228a0a0d42181fd74ebf2e6',
+      'f1cc9cd3bdac8d46046ed771cff1ca7cb9106a984f96a3dc849c7fe46c21de07',
 };
 
 void main(List<String> args) async {
