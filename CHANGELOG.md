@@ -1,6 +1,6 @@
 ## Unreleased
 
-- Change: the `sslRootCert` warning now starts with `[mysql] warning:` (was `dox_mysql_native: warning:`).
+- Change: the `sslRootCert` warning and the failed KILL warning now start with `[mysql] warning:` (was `dox_mysql_native: warning:`).
 
 ## 3.2.0
 
