@@ -334,7 +334,7 @@ void main() {
     }, stderr: () => err);
     expect(
       err.text.toString(),
-      'dox_mysql_native: warning: sslRootCert (ssl_ca) is ignored '
+      '[mysql] warning: sslRootCert (ssl_ca) is ignored '
       'because TLS is off (secure / require_ssl is not on).\n',
     );
   });

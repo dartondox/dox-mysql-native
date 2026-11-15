@@ -222,7 +222,7 @@ class MysqlNativePool {
     if (query.containsKey('ssl_ca') && query['require_ssl'] != 'true') {
       _warnedCaIgnored = true;
       stderr.writeln(
-        'dox_mysql_native: warning: sslRootCert (ssl_ca) is ignored '
+        '[mysql] warning: sslRootCert (ssl_ca) is ignored '
         'because TLS is off (secure / require_ssl is not on).',
       );
     }

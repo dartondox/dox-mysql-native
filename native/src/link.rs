@@ -1492,7 +1492,7 @@ fn kill_failed(f: &Fail) {
         Fail::Cancelled => return,
     };
     eprintln!(
-        "dox_mysql_native: warning: KILL of a cancelled or timed out query failed, \
+        "[mysql] warning: KILL of a cancelled or timed out query failed, \
          it may still run on the server: {why}"
     );
 }

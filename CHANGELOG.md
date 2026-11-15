@@ -1,3 +1,7 @@
+## Unreleased
+
+- Change: the `sslRootCert` warning and the failed KILL warning now start with `[mysql] warning:` (was `dox_mysql_native: warning:`).
+
 ## 3.2.0
 
 - Fix: the KILL for a timed out or cancelled query could reach another server. A thread id means something on one server only, so the KILL could stop another session there and roll back its transaction. This could happen with failover, a host name with many addresses, or a load balancer. Now the KILL connection goes only to the address of the query's connection. Each TCP connection also reads the server name once after its login (`@@server_uuid`, on MariaDB the hostname, port and server_id), in the same write as its first query. The KILL is only sent when both connections got the same name. Else no KILL is sent and a warning is printed.
