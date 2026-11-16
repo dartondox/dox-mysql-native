@@ -3,6 +3,7 @@ import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:dox_mysql_native/dox_mysql_native.dart';
+import 'package:dox_mysql_native/src/pool.dart' show debugColumnsCached;
 import 'package:test/test.dart';
 
 /// DB_PORT and DB_USER like the dox_orm tests. MySQL 8.4 or MariaDB 11.
@@ -352,6 +353,19 @@ void main() {
       for (int i = 0; i < 4; i++) Isolate.run(() => _isolateWork(handle)),
     ]);
     expect(sums, everyElement(_isolateSum));
+  });
+
+  group('column cache', () {
+    test('a short sql is cached, a long sql is not', () async {
+      String short = 'SELECT 1 AS one /* cache short */';
+      String long = 'SELECT 2 AS two /* ${'x' * 5000} */';
+      expect((await pool.query(short)).rows.single['one'], 1);
+      expect((await pool.query(long)).rows.single['two'], 2);
+      expect(debugColumnsCached(short), isTrue);
+      expect(debugColumnsCached(long), isFalse);
+      // the long one still works a second time
+      expect((await pool.query(long)).rows.single['two'], 2);
+    });
   });
 }
 

@@ -866,6 +866,9 @@ class _Link {
   static final Map<String, (Uint8List, List<String>)> _columns =
       <String, (Uint8List, List<String>)>{};
 
+  /// longest sql text (in characters) that goes in [_columns]
+  static const int _maxCachedSql = 4096;
+
   static MysqlNativeResult _rows(Uint8List b, ByteData d, int p, String sql) {
     int affected = d.getUint64(p, Endian.little);
     int insertId = d.getUint64(p + 8, Endian.little);
@@ -886,11 +889,15 @@ class _Link {
         names[i] = _text(b, at + 2, len);
         at += 2 + len;
       }
-      if (_columns.length >= 1024) _columns.clear();
-      known = _columns[sql] = (
+      known = (
         Uint8List.fromList(Uint8List.sublistView(b, start, p)),
         List<String>.unmodifiable(names), // shared by results
       );
+      // a long sql is not kept: the cap counts entries, not bytes
+      if (sql.length <= _maxCachedSql) {
+        if (_columns.length >= 1024) _columns.clear();
+        _columns[sql] = known;
+      }
     }
     List<String> names = known.$2;
     List<Map<String, dynamic>> rows = <Map<String, dynamic>>[];
@@ -1007,3 +1014,7 @@ class _Pending {
 void debugPoisonColumns(String sql, List<int> bytes) {
   _Link._columns[sql] = (Uint8List.fromList(bytes), const <String>[]);
 }
+
+/// For tests only (not exported by the package): true when the columns of
+/// [sql] are in the cache.
+bool debugColumnsCached(String sql) => _Link._columns.containsKey(sql);
