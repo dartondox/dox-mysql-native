@@ -1,4 +1,4 @@
-## Unreleased
+## 3.2.1
 
 - Memory: the column cache holds up to 1024 queries, whatever their size. Now a query text longer than 4 KB is not cached. Short queries keep their cache.
 - Change: the `sslRootCert` warning and the failed KILL warning now start with `[mysql] warning:` (was `dox_mysql_native: warning:`).
