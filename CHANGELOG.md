@@ -1,3 +1,7 @@
+## Unreleased
+
+- The ready-built Linux libraries do not need `libgcc_s.so.1`. They need only glibc 2.34 or newer, as before. A `FROM scratch` Docker image with the Dart `/runtime/` files does not need a copy of `libgcc_s.so.1` for this package. The release build now links the Linux libraries with `cargo zigbuild`, and CI does a check of each library.
+
 ## 3.2.1
 
 - Memory: the column cache holds up to 1024 queries, whatever their size. Now a query text longer than 4 KB is not cached. Short queries keep their cache.
